@@ -266,7 +266,7 @@ export default function App() {
                   rows={6}
                   value={pasteText}
                   onChange={(e) => setPasteText(e.target.value)}
-                  placeholder={"C:\\Users\\miyaz\\...\\レポート.html\nG:\\マイドライブ\\案件X\\納品レビュー.html"}
+                  placeholder={"C:\\Users\\...\\レポート.html\nG:\\マイドライブ\\案件X\\納品レビュー.html"}
                 />
                 <div className={css.pasteBtns}>
                   <button onClick={() => void doPasteImport()}>取り込み</button>

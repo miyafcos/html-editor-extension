@@ -64,7 +64,7 @@ export const DEFAULT_SETTINGS: Settings = {
   groupRules: [
     { pattern: "/AppData/Local/Temp/claude/", group: "scratchpad(揮発)" },
     { pattern: "^[a-z]:/マイドライブ/([^/]+)/", group: "$1" },
-    { pattern: "^c:/Users/miyaz/([^/]+)/", group: "$1" }
+    { pattern: "^[a-z]:/Users/[^/]+/([^/]+)/", group: "$1" }
   ],
   tabGroupTitle: "レポート",
   tabGroupColor: "blue"

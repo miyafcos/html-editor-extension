@@ -1,3 +1,50 @@
+.tabRoot {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  background: #f9fafb;
+}
+
+.tabBar {
+  display: flex;
+  gap: 2px;
+  padding: 6px 8px 0;
+  background: #fff;
+  border-bottom: 1px solid #e5e7eb;
+}
+
+.tabBtn,
+.tabActive {
+  flex: 1;
+  padding: 7px 8px;
+  font-size: 12.5px;
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-radius: 8px 8px 0 0;
+  background: none;
+  color: #6b7280;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.tabBtn:hover {
+  background: #f3f4f6;
+}
+
+.tabActive {
+  background: #f9fafb;
+  border-color: #e5e7eb;
+  color: #1d4ed8;
+  font-weight: 600;
+  margin-bottom: -1px;
+}
+
+.tabBody {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
 .panel {
   display: grid;
   grid-template-rows: auto 1fr auto;

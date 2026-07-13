@@ -3,8 +3,8 @@ import pkg from "./package.json" with { type: "json" };
 
 export default defineManifest({
   manifest_version: 3,
-  name: "HTML Editor (WYSIWYG)",
-  short_name: "HTML Editor",
+  name: "HTML Hub — 編集 + レポート管理",
+  short_name: "HTML Hub",
   version: pkg.version,
   description: pkg.description,
   icons: {
@@ -30,12 +30,32 @@ export default defineManifest({
       run_at: "document_idle"
     }
   ],
-  permissions: ["storage", "activeTab", "sidePanel", "downloads", "scripting"],
+  permissions: [
+    "storage",
+    "activeTab",
+    "sidePanel",
+    "downloads",
+    "scripting",
+    "tabs",
+    "tabGroups",
+    "history",
+    "webNavigation"
+  ],
   host_permissions: ["<all_urls>"],
   web_accessible_resources: [
     {
       resources: ["src/editor/editor.html"],
       matches: ["<all_urls>"]
     }
-  ]
+  ],
+  commands: {
+    "organize-collapse": {
+      suggested_key: { default: "Ctrl+Shift+9" },
+      description: "レポートタブを集約して畳む (ぐっとまとめる)"
+    },
+    "toggle-collapse": {
+      suggested_key: { default: "Ctrl+Shift+8" },
+      description: "レポートグループの畳み/展開を切り替え"
+    }
+  }
 });

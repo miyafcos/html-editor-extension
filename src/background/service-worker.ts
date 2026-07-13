@@ -1,3 +1,7 @@
+import { initReportHub } from "./reporthub-sw";
+
+initReportHub();
+
 async function openEditorForTab(tab: chrome.tabs.Tab): Promise<boolean> {
   if (!tab.id) return false;
   try {

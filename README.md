@@ -1,7 +1,26 @@
-# html-editor-extension
+# HTML Hub (html-editor-extension)
 
-Chrome 拡張(Manifest V3)で動く WYSIWYG HTML エディタ。
-Chrome で開いた見た目そのままに、`contenteditable` で直接編集できる。
+Chrome 拡張(Manifest V3)。ローカル HTML を扱う2機能を1拡張に統合:
+
+1. **編集 (HTML Editor)** — Chrome で開いた見た目そのままに `contenteditable` で直接編集
+2. **レポート管理 (Report Hub)** — 開いた file:// HTML を自動カタログ化+タブ整理 (2026-07-13 統合)
+
+## Report Hub 機能 (`src/reporthub/` + `src/dashboard/` + `src/background/reporthub-sw.ts`)
+
+- file://*.html を開いた瞬間に自動記録 (タイトル/パス/回数)。導入時に Chrome 履歴からバックフィル
+- Side Panel「📚 レポート」タブ: 検索・最近・ピン留め・開いているタブ・タブセット保存/復元
+- **ぐっとまとめる** `Ctrl+Shift+9` = 「レポート」タブグループへ集約+折りたたみ / `Ctrl+Shift+8` = 畳み展開
+- ダッシュボード (フルページ): 案件別グルーピング・一括操作・存在確認 (消失検出)・JSON入出力・設定
+- アイコンバッジ = 開いているレポートタブ数
+- 実装ノート: 正規化キー (decode→NFC→小文字) で重複統合 / webNavigation の ERR_FILE_NOT_FOUND+navfail フラグで死活 /
+  新規作成タブは tabs.query に載る前なので **タブIDを直接グループ化** (commit レース回避)
+
+E2E: `scratchpad/report-hub-e2e/e2e-merged.mjs` (CDP・22項目。Chrome for Testing +
+`--load-extension` + `--disable-features=DisableLoadExtensionCommandLineSwitch` が必要)
+
+---
+
+以下は編集 (HTML Editor) 側のドキュメント。
 
 ## 設計の核
 

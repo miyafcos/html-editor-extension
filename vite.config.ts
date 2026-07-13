@@ -10,7 +10,8 @@ export default defineConfig({
     rollupOptions: {
       input: {
         editor: "src/editor/editor.html",
-        sidepanel: "src/sidepanel/sidepanel.html"
+        sidepanel: "src/sidepanel/sidepanel.html",
+        dashboard: "src/dashboard/dashboard.html"
       }
     }
   },

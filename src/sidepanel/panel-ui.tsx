@@ -1,8 +1,54 @@
 import { useState, useCallback, useEffect } from "react";
 import { listRecent, type StoredHandle } from "../editor/core/handleStore";
+import { ReportPanel } from "../reporthub/ReportPanel";
 import styles from "./sidepanel.module.css";
 
+type PanelTab = "report" | "editor";
+const PANEL_TAB_KEY = "ui:panelTab";
+
 export function SidePanel() {
+  const [tab, setTab] = useState<PanelTab>("report");
+  const [tabLoaded, setTabLoaded] = useState(false);
+
+  useEffect(() => {
+    void chrome.storage.local.get(PANEL_TAB_KEY).then((got) => {
+      const v = got[PANEL_TAB_KEY];
+      if (v === "editor" || v === "report") setTab(v);
+      setTabLoaded(true);
+    });
+  }, []);
+
+  const select = useCallback((t: PanelTab) => {
+    setTab(t);
+    void chrome.storage.local.set({ [PANEL_TAB_KEY]: t });
+  }, []);
+
+  if (!tabLoaded) return null;
+
+  return (
+    <div className={styles.tabRoot}>
+      <div className={styles.tabBar}>
+        <button
+          className={tab === "report" ? styles.tabActive : styles.tabBtn}
+          onClick={() => select("report")}
+        >
+          📚 レポート
+        </button>
+        <button
+          className={tab === "editor" ? styles.tabActive : styles.tabBtn}
+          onClick={() => select("editor")}
+        >
+          ✏️ 編集
+        </button>
+      </div>
+      <div className={styles.tabBody}>
+        {tab === "report" ? <ReportPanel /> : <EditorPanel />}
+      </div>
+    </div>
+  );
+}
+
+function EditorPanel() {
   const [status, setStatus] = useState<string>("操作を選んでください。");
   const [busy, setBusy] = useState(false);
   const [recent, setRecent] = useState<StoredHandle[]>([]);

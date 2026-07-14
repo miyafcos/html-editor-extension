@@ -26,9 +26,11 @@ export default defineManifest({
   content_scripts: [
     {
       // 2026-07-14 perf: was <all_urls> — no reason to load the editor script
-      // into every website; file pages and *.html(.htm) URLs cover real usage
+      // into every website; file pages and *.html(.htm) URLs cover real usage.
+      // Trailing * keeps query-string URLs (page.html?x=1) matched — match
+      // patterns compare against path+query (code-review [6])
       js: ["src/content/quick-edit.ts"],
-      matches: ["file:///*", "*://*/*.html", "*://*/*.htm"],
+      matches: ["file:///*", "*://*/*.html*", "*://*/*.htm*"],
       run_at: "document_idle"
     },
     {

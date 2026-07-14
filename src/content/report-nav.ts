@@ -10,7 +10,9 @@
 import type { ReportEntry } from "../reporthub/types";
 import { isEntryStorageKey } from "../reporthub/repo";
 
-const HIDE_KEY = "reportnav:hidden";
+// per-page key: Chrome shares one localStorage across all file:// pages, so a
+// fixed key would hide the button everywhere (code-review [7])
+const HIDE_KEY = `reportnav:hidden:${location.pathname.toLowerCase()}`;
 const HOST_ID = "he-report-nav";
 
 function currentKey(): string {

@@ -20,8 +20,10 @@ export async function getUndoSnapshot(): Promise<UndoSnapshot | null> {
 export async function undoLastClose(settings: Settings): Promise<number | null> {
   const snapshot = await getUndoSnapshot();
   if (!snapshot || !snapshot.urls.length) return null;
-  await chrome.storage.local.remove(UNDO_KEY);
+  // reopen FIRST, drop the snapshot only on success — deleting it up front
+  // makes a failed reopen unrecoverable (code-review [4])
   await openEntries(snapshot.urls, settings);
+  await chrome.storage.local.remove(UNDO_KEY);
   return snapshot.urls.length;
 }
 

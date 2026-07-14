@@ -152,11 +152,16 @@ try {
   }
   check("decision JSON written to inbox", !!decisionFile || !!sawAny, decisionFile || `observed: ${sawAny || "(nothing)"}`);
   if (decisionFile) {
-    // both the note probe and the done click drop files for QID — assert on the done one
-    const fresh = fs.readdirSync(INBOX).filter((f) => !before.has(f) && f.includes(QID) && f.endsWith(".json"));
-    const bodies = fresh.map((f) => JSON.parse(fs.readFileSync(path.join(INBOX, f), "utf-8")));
-    const doneBody = bodies.find((b) => b.action === "done");
-    check("payload fields", !!doneBody && doneBody.qid === QID && doneBody.via === "html-hub-extension", JSON.stringify(doneBody ?? bodies));
+    // both the note probe and the done click drop files for QID — poll until
+    // the done one lands (the note file often arrives first)
+    let doneBody = null;
+    for (let i = 0; i < 20 && !doneBody; i++) {
+      const fresh = fs.readdirSync(INBOX).filter((f) => !before.has(f) && f.includes(QID) && f.endsWith(".json"));
+      const bodies = fresh.map((f) => JSON.parse(fs.readFileSync(path.join(INBOX, f), "utf-8")));
+      doneBody = bodies.find((b) => b.action === "done") ?? null;
+      if (!doneBody) await sleep(500);
+    }
+    check("payload fields", !!doneBody && doneBody.qid === QID && doneBody.via === "html-hub-extension", JSON.stringify(doneBody));
   }
   await sleep(3000); // ack window is 2500ms
   const decided = await evalIn(cdp, sessionId, `document.querySelector('[data-qid="${QID}"]').classList.contains('decided')`);

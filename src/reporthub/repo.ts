@@ -119,13 +119,24 @@ export async function getPanelIndex(): Promise<ReportEntry[] | null> {
   return Array.isArray(list) ? list : null;
 }
 
-export async function updatePanelIndex(entry: ReportEntry): Promise<void> {
-  const cur = await getPanelIndex();
-  if (cur === null) {
-    await rebuildPanelIndex();
-    return;
-  }
-  await chrome.storage.local.set({ [PANEL_INDEX_KEY]: trimPanelIndex([...cur, entry]) });
+// Serialize index writes within this JS context (code-review [8]): several
+// report tabs finishing at once fire concurrent upsertVisit calls whose
+// read-modify-writes would drop each other's entry. Cross-context races
+// (panel pin vs SW visit) remain possible but self-heal on the next write.
+let indexWriteChain: Promise<unknown> = Promise.resolve();
+
+export function updatePanelIndex(entry: ReportEntry): Promise<void> {
+  const task = async () => {
+    const cur = await getPanelIndex();
+    if (cur === null) {
+      await rebuildPanelIndex();
+      return;
+    }
+    await chrome.storage.local.set({ [PANEL_INDEX_KEY]: trimPanelIndex([...cur, entry]) });
+  };
+  const next = indexWriteChain.then(task, task);
+  indexWriteChain = next.catch(() => undefined);
+  return next;
 }
 
 /** Full rebuild from all entries — used as migration (missing index) and after bulk writes. */

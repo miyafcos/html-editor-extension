@@ -39,7 +39,8 @@ document.addEventListener(DECISION_EVENT, (event) => {
     },
     (res?: { ok?: boolean }) => {
       if (chrome.runtime.lastError || !res?.ok) return;
-      document.dispatchEvent(new CustomEvent(ACK_EVENT));
+      // qid を ack に載せる (ページ側は qid 単位で待つ — 連打時の混線防止)
+      document.dispatchEvent(new CustomEvent(ACK_EVENT, { detail: JSON.stringify({ qid }) }));
     }
   );
 });

@@ -226,7 +226,7 @@ export async function focusOrOpen(
       /* window may be gone; tabs.update below will throw and surface it */
     }
     await chrome.tabs.update(found.tab.id, { active: true });
-    await chrome.windows.update(found.tab.windowId, { focused: true, drawAttention: true });
+    await chrome.windows.update(found.tab.windowId, { focused: true });
   } else {
     await chrome.tabs.create({ url });
   }

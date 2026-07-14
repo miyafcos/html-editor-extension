@@ -317,7 +317,9 @@ export function ReportPanel() {
       </div>
 
       <div className={css.footer}>
-        <span className={css.status}>{status}</span>
+        <span className={css.status}>
+          {status || `v${chrome.runtime.getManifest().version}`}
+        </span>
         <button
           className={css.dashBtn}
           onClick={() =>

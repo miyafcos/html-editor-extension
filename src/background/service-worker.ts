@@ -84,47 +84,24 @@ async function injectUpdateBanners() {
   }
 }
 
-chrome.runtime.onInstalled.addListener((details) => {
+// 2026-07-14 ユーザー報告「サイドバーが開かないことが結構ある」: 旧設計はHTMLページで
+// quick-edit トグルを先に試す分岐があり、その await 中に user gesture が失効して
+// sidePanel.open が落ちることがあった。アイコンは常にサイドパネル固定 (Chrome の
+// ネイティブ挙動に委譲・gesture 問題が構造的に消える)。その場編集はパネルの
+// ✏️編集タブ「このタブをその場で編集」から。
+function applyPanelBehavior(): void {
   chrome.sidePanel
-    .setPanelBehavior({ openPanelOnActionClick: false })
+    .setPanelBehavior({ openPanelOnActionClick: true })
     .catch((e) => console.warn("setPanelBehavior failed", e));
+}
+
+applyPanelBehavior();
+
+chrome.runtime.onInstalled.addListener((details) => {
+  applyPanelBehavior();
   if (details.reason === "update") {
     void injectUpdateBanners();
   }
-});
-
-function looksLikeHtmlPage(url: string | undefined): boolean {
-  if (!url) return false;
-  const stripped = url.split(/[?#]/)[0] ?? "";
-  if (/^file:\/\//i.test(url)) {
-    return /\.html?$/i.test(stripped);
-  }
-  if (/^https?:\/\//i.test(url)) {
-    return /\.html?$/i.test(stripped);
-  }
-  return false;
-}
-
-chrome.action.onClicked.addListener(async (tab) => {
-  if (tab.id && looksLikeHtmlPage(tab.url)) {
-    try {
-      const res = (await chrome.tabs.sendMessage(tab.id, {
-        type: "quick-edit:toggle"
-      })) as { ok: boolean; editing?: boolean } | undefined;
-      if (res?.ok) return;
-    } catch (e) {
-      console.warn("quick-edit toggle failed", e);
-    }
-  }
-  if (tab.windowId !== undefined) {
-    try {
-      await chrome.sidePanel.open({ windowId: tab.windowId });
-      return;
-    } catch (e) {
-      console.warn("sidePanel.open failed", e);
-    }
-  }
-  await chrome.tabs.create({ url: chrome.runtime.getURL("src/editor/editor.html") });
 });
 
 interface DownloadMessage {

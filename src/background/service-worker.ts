@@ -133,6 +133,46 @@ interface DownloadMessage {
   filename: string;
 }
 
+interface ClaudeOpsDecisionMessage {
+  type: "claudeops-decision";
+  qid: string;
+  action: string;
+  note: string;
+  ts: string;
+}
+
+const CLAUDEOPS_QID_RE = /^q-\d{8}-\d{6}-[0-9a-f]{4}$/;
+const CLAUDEOPS_ACTIONS = new Set(["done", "dismissed", "note"]);
+
+/** UTF-8 safe base64 for a data: URL (no Blob URLs in MV3 service workers). */
+function toBase64Utf8(text: string): string {
+  const bytes = new TextEncoder().encode(text);
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
+/**
+ * Persist a dashboard decision as a JSON file under
+ * Downloads/claude-ops-decisions/. The Claude Ops watcher polls that folder
+ * (15 min cycle), applies the decision to its queue, then deletes the file.
+ */
+async function saveClaudeOpsDecision(message: ClaudeOpsDecisionMessage): Promise<number> {
+  const body = JSON.stringify({
+    qid: message.qid,
+    action: message.action,
+    note: message.note,
+    ts: message.ts,
+    via: "html-hub-extension"
+  });
+  return chrome.downloads.download({
+    url: `data:application/json;base64,${toBase64Utf8(body)}`,
+    filename: `claude-ops-decisions/decision-${message.qid}-${Date.now()}.json`,
+    saveAs: false,
+    conflictAction: "uniquify"
+  });
+}
+
 interface OpenEditorMessage {
   type: "open-editor-tab";
 }
@@ -149,7 +189,8 @@ type IncomingMessage =
   | DownloadMessage
   | OpenEditorMessage
   | ToggleQuickEditMessage
-  | EditCurrentTabMessage;
+  | EditCurrentTabMessage
+  | ClaudeOpsDecisionMessage;
 
 chrome.runtime.onMessage.addListener((message: IncomingMessage, sender, sendResponse) => {
   if (sender.id !== chrome.runtime.id) return;
@@ -206,5 +247,19 @@ chrome.runtime.onMessage.addListener((message: IncomingMessage, sender, sendResp
       .then((id) => sendResponse({ ok: true, id }))
       .catch((e) => sendResponse({ ok: false, error: String(e) }));
     return true;
+  }
+
+  if (message.type === "claudeops-decision") {
+    if (!CLAUDEOPS_QID_RE.test(message.qid) || !CLAUDEOPS_ACTIONS.has(message.action)) {
+      sendResponse({ ok: false, error: "invalid decision payload" });
+      return;
+    }
+    // Respond immediately: downloads.download can take seconds on SW cold
+    // start, and the dashboard's optimistic UI waits on this ack. The decision
+    // file is fire-and-forget; the watcher-rendered queue state is the truth
+    // and a failed write resurfaces the card after the optimistic TTL.
+    sendResponse({ ok: true });
+    saveClaudeOpsDecision(message).catch((e) => console.warn("claudeops decision save failed", e));
+    return;
   }
 });

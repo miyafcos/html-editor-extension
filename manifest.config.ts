@@ -28,6 +28,11 @@ export default defineManifest({
       js: ["src/content/quick-edit.ts"],
       matches: ["<all_urls>"],
       run_at: "document_idle"
+    },
+    {
+      js: ["src/content/dashboard-actions.ts"],
+      matches: ["file:///*claude-ops/dashboard/*"],
+      run_at: "document_idle"
     }
   ],
   permissions: [

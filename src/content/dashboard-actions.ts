@@ -29,18 +29,31 @@ document.addEventListener(DECISION_EVENT, (event) => {
   const qid = String(payload.qid ?? "");
   const action = String(payload.action ?? "");
   if (!QID_RE.test(qid) || !ACTIONS.has(action)) return;
-  chrome.runtime.sendMessage(
-    {
-      type: "claudeops-decision",
-      qid,
-      action,
-      note: String(payload.note ?? ""),
-      ts: String(payload.ts ?? "")
-    },
-    (res?: { ok?: boolean }) => {
-      if (chrome.runtime.lastError || !res?.ok) return;
-      // qid を ack に載せる (ページ側は qid 単位で待つ — 連打時の混線防止)
-      document.dispatchEvent(new CustomEvent(ACK_EVENT, { detail: JSON.stringify({ qid }) }));
-    }
-  );
+  try {
+    chrome.runtime.sendMessage(
+      {
+        type: "claudeops-decision",
+        qid,
+        action,
+        note: String(payload.note ?? ""),
+        ts: String(payload.ts ?? "")
+      },
+      () => {
+        // consume lastError so Chrome doesn't log an unchecked-error warning
+        if (chrome.runtime.lastError) {
+          console.warn("claudeops decision delivery failed", chrome.runtime.lastError.message);
+        }
+      }
+    );
+  } catch (e) {
+    // extension context invalidated (e.g. reloaded) — no ack, page shows fallback
+    console.warn("claudeops decision sendMessage threw", e);
+    return;
+  }
+  // ack immediately: the payload is validated here and Chrome queues the message
+  // (waking the SW) — waiting for the SW's reply raced its cold start and lost
+  // acks (probe7: ackLog stayed empty while the file was still written). The
+  // SW's ok-reply never meant "file written" anyway; the watcher-rendered queue
+  // remains the source of truth.
+  document.dispatchEvent(new CustomEvent(ACK_EVENT, { detail: JSON.stringify({ qid }) }));
 });

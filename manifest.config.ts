@@ -50,6 +50,7 @@ export default defineManifest({
     "sidePanel",
     "downloads",
     "downloads.ui",
+    "nativeMessaging",
     "scripting",
     "tabs",
     "tabGroups",

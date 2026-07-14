@@ -120,6 +120,9 @@ interface ClaudeOpsDecisionMessage {
 
 const CLAUDEOPS_QID_RE = /^q-\d{8}-\d{6}-[0-9a-f]{4}$/;
 const CLAUDEOPS_ACTIONS = new Set(["done", "dismissed", "note"]);
+// Native messaging host (C:/Users/miyaz/claude-ops/bin/decisions_host.py) —
+// writes the decision file directly, no chrome.downloads involved
+const CLAUDEOPS_NATIVE_HOST = "com.claude_ops.decisions";
 
 /** UTF-8 safe base64 for a data: URL (no Blob URLs in MV3 service workers). */
 function toBase64Utf8(text: string): string {
@@ -149,19 +152,30 @@ function waitForDownloadEnd(id: number, timeoutMs = 8000): Promise<void> {
  * Downloads/claude-ops-decisions/. The Claude Ops watcher polls that folder
  * (15 min cycle), applies the decision to its queue, then deletes the file.
  *
- * This is plumbing, not a user-facing download (2026-07-14 ユーザー報告「JSONが
- * ダウンロードされる設計はやめて・反映だけされればいい」): the download UI is
- * suppressed while the file is written and the history entry erased after, so
- * nothing shows up in the download bubble. The file itself stays for the watcher.
+ * Primary path (2026-07-14 ユーザー報告「JSONがダウンロードされる設計はやめて・
+ * 反映だけされればいい」): a native messaging host writes the file directly —
+ * no chrome.downloads, nothing in the download UI at all. If the host is not
+ * registered (registry key absent), we fall back to a suppressed download
+ * (UI disabled during the write + history entry erased afterwards).
  */
 async function saveClaudeOpsDecision(message: ClaudeOpsDecisionMessage): Promise<void> {
-  const body = JSON.stringify({
+  const payload = {
     qid: message.qid,
     action: message.action,
     note: message.note,
     ts: message.ts,
     via: "html-hub-extension"
-  });
+  };
+  try {
+    const res = (await chrome.runtime.sendNativeMessage(CLAUDEOPS_NATIVE_HOST, payload)) as
+      | { ok?: boolean; error?: string }
+      | undefined;
+    if (res?.ok) return;
+    throw new Error(res?.error ?? "native host rejected the decision");
+  } catch (e) {
+    console.warn("claudeops native host unavailable — silent download fallback", e);
+  }
+  const body = JSON.stringify(payload);
   try {
     await chrome.downloads.setUiOptions({ enabled: false });
   } catch {

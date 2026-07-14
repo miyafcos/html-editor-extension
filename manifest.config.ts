@@ -25,8 +25,10 @@ export default defineManifest({
   },
   content_scripts: [
     {
+      // 2026-07-14 perf: was <all_urls> — no reason to load the editor script
+      // into every website; file pages and *.html(.htm) URLs cover real usage
       js: ["src/content/quick-edit.ts"],
-      matches: ["<all_urls>"],
+      matches: ["file:///*", "*://*/*.html", "*://*/*.htm"],
       run_at: "document_idle"
     },
     {

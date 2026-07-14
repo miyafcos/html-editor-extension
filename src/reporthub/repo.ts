@@ -51,6 +51,7 @@ export async function getEntry(id: string): Promise<ReportEntry | null> {
 
 export async function putEntry(e: ReportEntry): Promise<void> {
   await chrome.storage.local.set({ [entryStorageKey(e.id)]: e });
+  await updatePanelIndex(e);
 }
 
 export async function putEntries(list: ReportEntry[]): Promise<void> {
@@ -58,6 +59,7 @@ export async function putEntries(list: ReportEntry[]): Promise<void> {
   const record: Record<string, ReportEntry> = {};
   for (const e of list) record[entryStorageKey(e.id)] = e;
   await chrome.storage.local.set(record);
+  await rebuildPanelIndex();
 }
 
 export async function patchEntry(
@@ -81,6 +83,56 @@ export async function patchEntryByKey(
 export async function removeEntries(ids: string[]): Promise<void> {
   if (!ids.length) return;
   await chrome.storage.local.remove(ids.map(entryStorageKey));
+  const idx = await getPanelIndex();
+  if (idx) {
+    const gone = new Set(ids);
+    await chrome.storage.local.set({
+      [PANEL_INDEX_KEY]: idx.filter((e) => !gone.has(e.id))
+    });
+  }
+}
+
+// -------------------- panel index (2026-07-14 perf) --------------------
+// The side panel must open instantly. Reading every entry (storage.get(null))
+// scales with the history backfill (thousands of entries, MBs) and made the
+// panel feel heavy, so a small standing index (pinned ∪ recent 60) is kept up
+// to date on every write and the panel reads exactly one key. The full
+// enumeration remains for the library page, export, and panel search.
+const PANEL_INDEX_KEY = "index:panel";
+const PANEL_RECENT_CAP = 60;
+
+function trimPanelIndex(list: ReportEntry[]): ReportEntry[] {
+  const byId = new Map<string, ReportEntry>();
+  for (const e of list) byId.set(e.id, e);
+  const alive = [...byId.values()].filter((e) => !e.archived);
+  const pinned = alive.filter((e) => e.pinned);
+  const recent = alive
+    .filter((e) => !e.pinned)
+    .sort((a, b) => b.lastSeenAt - a.lastSeenAt)
+    .slice(0, PANEL_RECENT_CAP);
+  return [...pinned, ...recent];
+}
+
+export async function getPanelIndex(): Promise<ReportEntry[] | null> {
+  const got = await chrome.storage.local.get(PANEL_INDEX_KEY);
+  const list = got[PANEL_INDEX_KEY] as ReportEntry[] | undefined;
+  return Array.isArray(list) ? list : null;
+}
+
+export async function updatePanelIndex(entry: ReportEntry): Promise<void> {
+  const cur = await getPanelIndex();
+  if (cur === null) {
+    await rebuildPanelIndex();
+    return;
+  }
+  await chrome.storage.local.set({ [PANEL_INDEX_KEY]: trimPanelIndex([...cur, entry]) });
+}
+
+/** Full rebuild from all entries — used as migration (missing index) and after bulk writes. */
+export async function rebuildPanelIndex(): Promise<ReportEntry[]> {
+  const list = trimPanelIndex(await getAllEntries());
+  await chrome.storage.local.set({ [PANEL_INDEX_KEY]: list });
+  return list;
 }
 
 export interface VisitInput {

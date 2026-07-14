@@ -52,7 +52,7 @@ function EntryRow({ entry }: { entry: ReportEntry }) {
 }
 
 export function ReportPanel() {
-  const { entries, settings, loaded, fileAccessAllowed, load } = useLibraryStore();
+  const { entries, settings, loaded, fileAccessAllowed, loadPanel, ensureFull } = useLibraryStore();
   const [query, setQuery] = useState("");
   const [openTabs, setOpenTabs] = useState<ReportTab[]>([]);
   const [status, setStatus] = useState("");
@@ -74,24 +74,46 @@ export function ReportPanel() {
   }, []);
 
   useEffect(() => {
-    void load();
-  }, [load]);
+    void loadPanel();
+  }, [loadPanel]);
 
   const refreshTabs = useCallback(async () => {
     if (!loaded) return;
-    setOpenTabs(await listReportTabs(settings));
+    const tabs = await listReportTabs(settings);
+    // identity-stable update: skip the re-render when nothing visible changed
+    setOpenTabs((prev) => {
+      const sig = (list: ReportTab[]) =>
+        list.map((t) => `${t.tab.id}:${t.norm.key}:${t.tab.title ?? ""}`).join("|");
+      return sig(prev) === sig(tabs) ? prev : tabs;
+    });
   }, [loaded, settings]);
 
   useEffect(() => {
     void refreshTabs();
-    const handler = () => void refreshTabs();
-    chrome.tabs.onUpdated.addListener(handler);
-    chrome.tabs.onRemoved.addListener(handler);
-    chrome.tabs.onActivated.addListener(handler);
+    // tabs.onUpdated fires for EVERY page-load step of EVERY tab; unfiltered it
+    // kept the panel re-querying while browsing (2026-07-14 重さFBの主因の一つ)
+    let timer: number | undefined;
+    const schedule = () => {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => void refreshTabs(), 400);
+    };
+    const onUpdated = (
+      _tabId: number,
+      changeInfo: chrome.tabs.TabChangeInfo,
+      tab: chrome.tabs.Tab
+    ) => {
+      if (changeInfo.status !== "complete" && !changeInfo.url) return;
+      const url = changeInfo.url ?? tab.url ?? "";
+      if (!url.startsWith("file:")) return;
+      schedule();
+    };
+    const onRemoved = () => schedule();
+    chrome.tabs.onUpdated.addListener(onUpdated);
+    chrome.tabs.onRemoved.addListener(onRemoved);
     return () => {
-      chrome.tabs.onUpdated.removeListener(handler);
-      chrome.tabs.onRemoved.removeListener(handler);
-      chrome.tabs.onActivated.removeListener(handler);
+      window.clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+      chrome.tabs.onRemoved.removeListener(onRemoved);
     };
   }, [refreshTabs]);
 
@@ -174,7 +196,12 @@ export function ReportPanel() {
           type="search"
           placeholder="タイトル・パスで検索"
           value={query}
-          onChange={(e) => setQuery(e.target.value)}
+          onChange={(e) => {
+            setQuery(e.target.value);
+            // the panel keeps only pinned∪recent in memory; searching upgrades
+            // to the full set once, lazily
+            if (e.target.value.trim()) void ensureFull();
+          }}
         />
       </div>
 

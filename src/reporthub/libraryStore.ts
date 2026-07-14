@@ -1,6 +1,12 @@
 import { create } from "zustand";
 import { isFileAccessAllowed } from "./liveness";
-import { getAllEntries, getSettings, isEntryStorageKey } from "./repo";
+import {
+  getAllEntries,
+  getPanelIndex,
+  getSettings,
+  isEntryStorageKey,
+  rebuildPanelIndex
+} from "./repo";
 import type { ReportEntry, Settings } from "./types";
 import { DEFAULT_SETTINGS } from "./types";
 
@@ -8,16 +14,56 @@ interface LibraryState {
   entries: Record<string, ReportEntry>;
   settings: Settings;
   loaded: boolean;
+  /** true once every entry is in memory (library page, or panel search fallback) */
+  fullLoaded: boolean;
   fileAccessAllowed: boolean | null;
+  /** full load — library page (needs groups, archive, export) */
   load: () => Promise<void>;
+  /** cheap load — side panel reads only the standing pinned∪recent index */
+  loadPanel: () => Promise<void>;
+  /** lazy upgrade to the full set (panel search) */
+  ensureFull: () => Promise<void>;
 }
 
 let subscribed = false;
+
+function subscribe(set: (p: Partial<LibraryState>) => void, get: () => LibraryState): void {
+  if (subscribed) return;
+  subscribed = true;
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== "local") return;
+    const cur = { ...get().entries };
+    let touched = false;
+    let nextSettings = get().settings;
+    for (const [k, ch] of Object.entries(changes)) {
+      if (isEntryStorageKey(k)) {
+        touched = true;
+        const nv = ch.newValue as ReportEntry | undefined;
+        if (nv) {
+          cur[nv.id] = nv;
+        } else {
+          const ov = ch.oldValue as ReportEntry | undefined;
+          if (ov) delete cur[ov.id];
+        }
+      } else if (k === "settings" && ch.newValue) {
+        nextSettings = { ...DEFAULT_SETTINGS, ...(ch.newValue as Partial<Settings>) };
+      }
+    }
+    set({ entries: touched ? cur : get().entries, settings: nextSettings });
+  });
+}
+
+function toDict(list: ReportEntry[]): Record<string, ReportEntry> {
+  const entries: Record<string, ReportEntry> = {};
+  for (const e of list) entries[e.id] = e;
+  return entries;
+}
 
 export const useLibraryStore = create<LibraryState>((set, get) => ({
   entries: {},
   settings: DEFAULT_SETTINGS,
   loaded: false,
+  fullLoaded: false,
   fileAccessAllowed: null,
 
   load: async () => {
@@ -26,34 +72,24 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
       getSettings(),
       isFileAccessAllowed()
     ]);
-    const entries: Record<string, ReportEntry> = {};
-    for (const e of list) entries[e.id] = e;
-    set({ entries, settings, loaded: true, fileAccessAllowed });
+    set({ entries: toDict(list), settings, loaded: true, fullLoaded: true, fileAccessAllowed });
+    subscribe(set, get);
+  },
 
-    if (!subscribed) {
-      subscribed = true;
-      chrome.storage.onChanged.addListener((changes, area) => {
-        if (area !== "local") return;
-        const cur = { ...get().entries };
-        let touched = false;
-        let nextSettings = get().settings;
-        for (const [k, ch] of Object.entries(changes)) {
-          if (isEntryStorageKey(k)) {
-            touched = true;
-            const nv = ch.newValue as ReportEntry | undefined;
-            if (nv) {
-              cur[nv.id] = nv;
-            } else {
-              const ov = ch.oldValue as ReportEntry | undefined;
-              if (ov) delete cur[ov.id];
-            }
-          } else if (k === "settings" && ch.newValue) {
-            nextSettings = { ...DEFAULT_SETTINGS, ...(ch.newValue as Partial<Settings>) };
-          }
-        }
-        set({ entries: touched ? cur : get().entries, settings: nextSettings });
-      });
-    }
+  loadPanel: async () => {
+    const [list, settings, fileAccessAllowed] = await Promise.all([
+      getPanelIndex().then((idx) => idx ?? rebuildPanelIndex()),
+      getSettings(),
+      isFileAccessAllowed()
+    ]);
+    set({ entries: toDict(list), settings, loaded: true, fileAccessAllowed });
+    subscribe(set, get);
+  },
+
+  ensureFull: async () => {
+    if (get().fullLoaded) return;
+    const list = await getAllEntries();
+    set({ entries: { ...toDict(list), ...get().entries }, fullLoaded: true });
   }
 }));
 

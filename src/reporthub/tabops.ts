@@ -215,8 +215,18 @@ export async function focusOrOpen(
   const targets = await listReportTabs(settings, true);
   const found = targets.find((t) => t.norm.key === key);
   if (found?.tab.id != null) {
+    // A minimized window ignores { focused: true } — restore it first, or the
+    // click appears to do nothing (2026-07-14 デイリーボタン無反応の実害).
+    try {
+      const win = await chrome.windows.get(found.tab.windowId);
+      if (win.state === "minimized") {
+        await chrome.windows.update(found.tab.windowId, { state: "normal" });
+      }
+    } catch {
+      /* window may be gone; tabs.update below will throw and surface it */
+    }
     await chrome.tabs.update(found.tab.id, { active: true });
-    await chrome.windows.update(found.tab.windowId, { focused: true });
+    await chrome.windows.update(found.tab.windowId, { focused: true, drawAttention: true });
   } else {
     await chrome.tabs.create({ url });
   }

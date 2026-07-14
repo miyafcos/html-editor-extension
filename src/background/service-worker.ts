@@ -129,12 +129,32 @@ function toBase64Utf8(text: string): string {
   return btoa(binary);
 }
 
+function waitForDownloadEnd(id: number, timeoutMs = 8000): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(done, timeoutMs);
+    function done() {
+      clearTimeout(timer);
+      chrome.downloads.onChanged.removeListener(onChanged);
+      resolve();
+    }
+    function onChanged(delta: chrome.downloads.DownloadDelta) {
+      if (delta.id === id && delta.state && delta.state.current !== "in_progress") done();
+    }
+    chrome.downloads.onChanged.addListener(onChanged);
+  });
+}
+
 /**
  * Persist a dashboard decision as a JSON file under
  * Downloads/claude-ops-decisions/. The Claude Ops watcher polls that folder
  * (15 min cycle), applies the decision to its queue, then deletes the file.
+ *
+ * This is plumbing, not a user-facing download (2026-07-14 ユーザー報告「JSONが
+ * ダウンロードされる設計はやめて・反映だけされればいい」): the download UI is
+ * suppressed while the file is written and the history entry erased after, so
+ * nothing shows up in the download bubble. The file itself stays for the watcher.
  */
-async function saveClaudeOpsDecision(message: ClaudeOpsDecisionMessage): Promise<number> {
+async function saveClaudeOpsDecision(message: ClaudeOpsDecisionMessage): Promise<void> {
   const body = JSON.stringify({
     qid: message.qid,
     action: message.action,
@@ -142,12 +162,27 @@ async function saveClaudeOpsDecision(message: ClaudeOpsDecisionMessage): Promise
     ts: message.ts,
     via: "html-hub-extension"
   });
-  return chrome.downloads.download({
-    url: `data:application/json;base64,${toBase64Utf8(body)}`,
-    filename: `claude-ops-decisions/decision-${message.qid}-${Date.now()}.json`,
-    saveAs: false,
-    conflictAction: "uniquify"
-  });
+  try {
+    await chrome.downloads.setUiOptions({ enabled: false });
+  } catch {
+    /* downloads.ui unavailable — fall through, worst case the shelf blips */
+  }
+  try {
+    const id = await chrome.downloads.download({
+      url: `data:application/json;base64,${toBase64Utf8(body)}`,
+      filename: `claude-ops-decisions/decision-${message.qid}-${Date.now()}.json`,
+      saveAs: false,
+      conflictAction: "uniquify"
+    });
+    await waitForDownloadEnd(id);
+    await chrome.downloads.erase({ id });
+  } finally {
+    try {
+      await chrome.downloads.setUiOptions({ enabled: true });
+    } catch {
+      /* ignore */
+    }
+  }
 }
 
 interface OpenEditorMessage {

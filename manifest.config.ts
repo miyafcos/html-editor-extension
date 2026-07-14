@@ -45,6 +45,7 @@ export default defineManifest({
     "activeTab",
     "sidePanel",
     "downloads",
+    "downloads.ui",
     "scripting",
     "tabs",
     "tabGroups",

@@ -3,6 +3,9 @@ export type Msg =
   | { type: "toggle-collapse" }
   | { type: "close-duplicate-tabs" }
   | { type: "close-report-tabs" }
+  | { type: "undo-close" }
+  | { type: "focus-or-open"; url?: string }
+  | { type: "open-hub-dashboard" }
   | { type: "open-entries"; urls: string[] }
   | { type: "save-tabset"; name: string }
   | { type: "open-tabset"; id: string }

@@ -33,6 +33,11 @@ export default defineManifest({
       js: ["src/content/dashboard-actions.ts"],
       matches: ["file:///*claude-ops/dashboard/*"],
       run_at: "document_idle"
+    },
+    {
+      js: ["src/content/report-nav.ts"],
+      matches: ["file:///*"],
+      run_at: "document_idle"
     }
   ],
   permissions: [

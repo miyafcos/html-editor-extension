@@ -1,6 +1,29 @@
-import type { Settings } from "./types";
+import type { Settings, UndoSnapshot } from "./types";
 import type { NormalizedFile } from "./url";
 import { isTargetFile, normalizeFileUrl } from "./url";
+
+/** storage.local key for the やりなおし (undo) snapshot of the last close op. */
+export const UNDO_KEY = "undo:lastClosed";
+
+async function saveUndoSnapshot(urls: string[], label: string): Promise<void> {
+  if (!urls.length) return;
+  const snapshot: UndoSnapshot = { urls, label, ts: Date.now() };
+  await chrome.storage.local.set({ [UNDO_KEY]: snapshot });
+}
+
+export async function getUndoSnapshot(): Promise<UndoSnapshot | null> {
+  const got = await chrome.storage.local.get(UNDO_KEY);
+  return (got[UNDO_KEY] as UndoSnapshot | undefined) ?? null;
+}
+
+/** Reopen the tabs recorded by the last close operation. Returns the count, or null when nothing to undo. */
+export async function undoLastClose(settings: Settings): Promise<number | null> {
+  const snapshot = await getUndoSnapshot();
+  if (!snapshot || !snapshot.urls.length) return null;
+  await chrome.storage.local.remove(UNDO_KEY);
+  await openEntries(snapshot.urls, settings);
+  return snapshot.urls.length;
+}
 
 export interface ReportTab {
   tab: chrome.tabs.Tab;
@@ -100,6 +123,7 @@ export async function closeDuplicateTabs(settings: Settings): Promise<number> {
     byKey.set(t.norm.key, list);
   }
   const toClose: number[] = [];
+  const closedUrls: string[] = [];
   for (const list of byKey.values()) {
     if (list.length < 2) continue;
     const keep =
@@ -108,17 +132,26 @@ export async function closeDuplicateTabs(settings: Settings): Promise<number> {
         (a, b) => (b.tab.lastAccessed ?? b.tab.id ?? 0) - (a.tab.lastAccessed ?? a.tab.id ?? 0)
       )[0];
     for (const t of list) {
-      if (t !== keep && t.tab.id != null) toClose.push(t.tab.id);
+      if (t !== keep && t.tab.id != null) {
+        toClose.push(t.tab.id);
+        closedUrls.push(t.norm.url);
+      }
     }
   }
-  if (toClose.length) await chrome.tabs.remove(toClose);
+  if (toClose.length) {
+    await saveUndoSnapshot(closedUrls, "かぶり閉じる");
+    await chrome.tabs.remove(toClose);
+  }
   return toClose.length;
 }
 
 export async function closeReportTabs(settings: Settings): Promise<number> {
   const targets = await listReportTabs(settings);
   const ids = targets.map((t) => t.tab.id).filter((id): id is number => id != null);
-  if (ids.length) await chrome.tabs.remove(ids);
+  if (ids.length) {
+    await saveUndoSnapshot(targets.map((t) => t.norm.url), "全部とじる");
+    await chrome.tabs.remove(ids);
+  }
   return ids.length;
 }
 

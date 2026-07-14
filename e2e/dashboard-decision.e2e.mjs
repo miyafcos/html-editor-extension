@@ -162,6 +162,53 @@ try {
   const decided = await evalIn(cdp, sessionId, `document.querySelector('[data-qid="${QID}"]').classList.contains('decided')`);
   check("card shows optimistic decided state", decided === true);
 
+  // 5. floating ☀ nav injected on the daily page (report-nav content script)
+  const navHost = await evalIn(cdp, sessionId, "!!document.getElementById('he-report-nav')");
+  check("floating nav injected on daily", navHost === true);
+
+  // helper: open an extension page and attach (full chrome API available there)
+  const openExtPage = async (rel) => {
+    await evalIn(cdp, swSession, `chrome.tabs.create({ url: chrome.runtime.getURL('${rel}') }).then(() => true)`);
+    let target = null;
+    for (let i = 0; i < 20 && !target; i++) {
+      const { targetInfos } = await cdp.send("Target.getTargets");
+      target = targetInfos.find((t) => t.type === "page" && t.url.includes(rel));
+      if (!target) await sleep(500);
+    }
+    const s = (await cdp.send("Target.attachToTarget", { targetId: target.targetId, flatten: true })).sessionId;
+    await cdp.send("Runtime.enable", {}, s);
+    await sleep(1500);
+    return s;
+  };
+
+  // 6. side panel: ☀デイリー + 5 buttons, 「集約のみ」 is gone
+  const panelS = await openExtPage("src/sidepanel/sidepanel.html");
+  const panelText = await evalIn(cdp, panelS, "document.body.innerText");
+  check(
+    "panel has daily + 5 simplified buttons",
+    ["☀ 今日のデイリー", "まとめる", "展開/畳む", "かぶり閉じる", "全部とじる", "やりなおし"].every((t) => panelText.includes(t)) &&
+      !panelText.includes("集約のみ"),
+    panelText.includes("集約のみ") ? "集約のみ still present" : ""
+  );
+
+  // 7. undo round-trip, driven from the Hub dashboard page (extension context)
+  const ctrlS = await openExtPage("src/dashboard/dashboard.html");
+  const n0 = await evalIn(cdp, ctrlS, "chrome.tabs.query({url:'file:///*'}).then(ts => ts.length)");
+  const closedRes = await evalIn(cdp, ctrlS, "chrome.runtime.sendMessage({type:'close-report-tabs'})");
+  await sleep(1500);
+  const n1 = await evalIn(cdp, ctrlS, "chrome.tabs.query({url:'file:///*'}).then(ts => ts.length)");
+  const undoRes = await evalIn(cdp, ctrlS, "chrome.runtime.sendMessage({type:'undo-close'})");
+  let n2 = 0;
+  for (let i = 0; i < 12 && n2 < n0; i++) {
+    await sleep(500);
+    n2 = await evalIn(cdp, ctrlS, "chrome.tabs.query({url:'file:///*'}).then(ts => ts.length)");
+  }
+  check(
+    "undo restores closed report tabs",
+    n0 >= 1 && closedRes?.count === n0 && n1 === 0 && undoRes?.ok === true && n2 === n0,
+    `before=${n0} closed=${closedRes?.count} after-close=${n1} undo=${JSON.stringify(undoRes)} restored=${n2}`
+  );
+
   console.log(JSON.stringify({ ok: results.every((r) => r.ok), extId, results }, null, 1));
 } finally {
   chrome.kill();

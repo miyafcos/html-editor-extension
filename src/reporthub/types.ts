@@ -34,6 +34,15 @@ export interface Settings {
   groupRules: GroupRule[];
   tabGroupTitle: string;
   tabGroupColor: chrome.tabGroups.ColorEnum;
+  /** The Claude Ops daily dashboard — one-tap target for ☀ buttons. */
+  dailyDashboardUrl: string;
+}
+
+/** Snapshot taken right before a close operation, for やりなおし (undo). Storage key: "undo:lastClosed" */
+export interface UndoSnapshot {
+  urls: string[];
+  label: string;
+  ts: number;
 }
 
 export interface Meta {
@@ -67,5 +76,6 @@ export const DEFAULT_SETTINGS: Settings = {
     { pattern: "^[a-z]:/Users/[^/]+/([^/]+)/", group: "$1" }
   ],
   tabGroupTitle: "レポート",
-  tabGroupColor: "blue"
+  tabGroupColor: "blue",
+  dailyDashboardUrl: "file:///C:/Users/miyaz/claude-ops/dashboard/index.html"
 };

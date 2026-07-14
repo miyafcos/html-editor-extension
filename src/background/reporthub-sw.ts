@@ -16,12 +16,14 @@ import {
 import {
   closeDuplicateTabs,
   closeReportTabs,
+  focusOrOpen,
   listReportTabs,
   openEntries,
   openTabSet,
   organizeTabs,
   saveCurrentTabSet,
-  toggleCollapse
+  toggleCollapse,
+  undoLastClose
 } from "../reporthub/tabops";
 import { isTargetFile, normalizeFileUrl } from "../reporthub/url";
 
@@ -30,6 +32,9 @@ const RH_TYPES = new Set<Msg["type"]>([
   "toggle-collapse",
   "close-duplicate-tabs",
   "close-report-tabs",
+  "undo-close",
+  "focus-or-open",
+  "open-hub-dashboard",
   "open-entries",
   "save-tabset",
   "open-tabset",
@@ -121,6 +126,24 @@ export function initReportHub(): void {
               break;
             case "close-report-tabs":
               sendResponse({ ok: true, count: await closeReportTabs(settings) });
+              break;
+            case "undo-close": {
+              const restored = await undoLastClose(settings);
+              sendResponse({ ok: restored !== null, count: restored ?? 0 });
+              break;
+            }
+            case "focus-or-open": {
+              const url = msg.url || settings.dailyDashboardUrl;
+              const norm = normalizeFileUrl(url);
+              await focusOrOpen(url, norm?.key ?? url.toLowerCase(), settings);
+              sendResponse({ ok: true, count: 1 });
+              break;
+            }
+            case "open-hub-dashboard":
+              await chrome.tabs.create({
+                url: chrome.runtime.getURL("src/dashboard/dashboard.html")
+              });
+              sendResponse({ ok: true, count: 1 });
               break;
             case "open-entries":
               sendResponse({ ok: true, count: await openEntries(msg.urls, settings) });

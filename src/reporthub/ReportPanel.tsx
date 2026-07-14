@@ -3,8 +3,8 @@ import type { Msg } from "./messages";
 import { sendMsg } from "./messages";
 import { isTabSetStorageKey, listTabSets, patchEntry, removeTabSet } from "./repo";
 import type { ReportTab } from "./tabops";
-import { focusOrOpen, listReportTabs } from "./tabops";
-import type { ReportEntry, TabSet } from "./types";
+import { focusOrOpen, getUndoSnapshot, listReportTabs, UNDO_KEY } from "./tabops";
+import type { ReportEntry, TabSet, UndoSnapshot } from "./types";
 import { fileName } from "./url";
 import { filterEntries, useLibraryStore } from "./libraryStore";
 import css from "./reporthub.module.css";
@@ -59,7 +59,19 @@ export function ReportPanel() {
   const [sets, setSets] = useState<TabSet[]>([]);
   const [setNameOpen, setSetNameOpen] = useState(false);
   const [setName, setSetName] = useState("");
+  const [undo, setUndo] = useState<UndoSnapshot | null>(null);
   const statusTimer = useRef<number | undefined>(undefined);
+
+  useEffect(() => {
+    void getUndoSnapshot().then(setUndo);
+    const handler = (changes: Record<string, chrome.storage.StorageChange>, area: string) => {
+      if (area === "local" && UNDO_KEY in changes) {
+        setUndo((changes[UNDO_KEY].newValue as UndoSnapshot | undefined) ?? null);
+      }
+    };
+    chrome.storage.onChanged.addListener(handler);
+    return () => chrome.storage.onChanged.removeListener(handler);
+  }, []);
 
   useEffect(() => {
     void load();
@@ -144,6 +156,13 @@ export function ReportPanel() {
   return (
     <div className={css.app}>
       <div className={css.header}>
+        <button
+          className={css.dailyBtn}
+          title="Claude Ops デイリーダッシュボードを開く (開いていればそのタブへ)"
+          onClick={() => void sendMsg({ type: "focus-or-open" })}
+        >
+          ☀ 今日のデイリー
+        </button>
         <input
           className={css.search}
           type="search"
@@ -189,32 +208,42 @@ export function ReportPanel() {
             title="file://タブを「レポート」グループに集約して畳む (Ctrl+Shift+9)"
             onClick={() => void runTabOp({ type: "organize-tabs", collapse: true }, "まとめ")}
           >
-            ぐっとまとめる
+            まとめる
           </button>
           <button
             title="レポートグループの畳み/展開 (Ctrl+Shift+8)"
             onClick={() => void runTabOp({ type: "toggle-collapse" }, "")}
           >
-            畳む/展開
+            展開/畳む
           </button>
         </div>
         <div className={css.btnRow}>
-          <button onClick={() => void runTabOp({ type: "organize-tabs" }, "集約")}>
-            集約のみ
+          <button
+            title="同じファイルの重複タブを閉じる (1つ残す)"
+            onClick={() => void runTabOp({ type: "close-duplicate-tabs" }, "かぶり閉じ")}
+          >
+            かぶり閉じる
           </button>
-          <button onClick={() => void runTabOp({ type: "close-duplicate-tabs" }, "重複クローズ")}>
-            重複を閉じる
+          <button
+            title="レポートタブを全部閉じる (やりなおしで戻せます)"
+            onClick={() => void runTabOp({ type: "close-report-tabs" }, "クローズ")}
+          >
+            全部とじる
           </button>
-          <button onClick={() => void runTabOp({ type: "close-report-tabs" }, "クローズ")}>
-            すべて閉じる
+          <button
+            disabled={!undo}
+            title={undo ? `「${undo.label}」で閉じた ${undo.urls.length}件を開き直す` : "戻せる操作はありません"}
+            onClick={() => void runTabOp({ type: "undo-close" }, "やりなおし")}
+          >
+            やりなおし
           </button>
         </div>
       </div>
 
-      <div className={css.section}>
-        <div className={css.sectionTitle}>
+      <details className={css.foldSection}>
+        <summary className={css.foldSummary}>
           タブセット <span className={css.count}>{sets.length}</span>
-        </div>
+        </summary>
         {setNameOpen ? (
           <div className={css.setSaveRow}>
             <input
@@ -259,7 +288,7 @@ export function ReportPanel() {
             </button>
           </div>
         ))}
-      </div>
+      </details>
 
       {pinned.length > 0 && (
         <div className={css.section}>

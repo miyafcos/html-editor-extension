@@ -118,8 +118,23 @@ interface ClaudeOpsDecisionMessage {
   ts: string;
 }
 
+interface StaffOpsTaskActionMessage {
+  type: "staffops-task-action";
+  ref: string;
+  actionId: string;
+  action: "complete" | "append_memo";
+  note: string;
+  source: "claude-chat" | "dashboard" | "slack";
+  dryRun: boolean;
+  ts: string;
+}
+
 const CLAUDEOPS_QID_RE = /^q-\d{8}-\d{6}-[0-9a-f]{4}$/;
 const CLAUDEOPS_ACTIONS = new Set(["done", "dismissed", "note"]);
+const STAFFOPS_REF_RE = /^T-[A-Z2-7]{8,52}(?:-\d+)?$/;
+const STAFFOPS_ACTION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,119}$/;
+const STAFFOPS_ACTIONS = new Set(["complete", "append_memo"]);
+const STAFFOPS_SOURCES = new Set(["claude-chat", "dashboard", "slack"]);
 // Native messaging host (C:/Users/miyaz/claude-ops/bin/decisions_host.py) —
 // writes the decision file directly, no chrome.downloads involved
 const CLAUDEOPS_NATIVE_HOST = "com.claude_ops.decisions";
@@ -199,6 +214,23 @@ async function saveClaudeOpsDecision(message: ClaudeOpsDecisionMessage): Promise
   }
 }
 
+function validStaffOpsTaskAction(message: StaffOpsTaskActionMessage): boolean {
+  return STAFFOPS_REF_RE.test(message.ref) &&
+    STAFFOPS_ACTION_ID_RE.test(message.actionId) &&
+    STAFFOPS_ACTIONS.has(message.action) &&
+    typeof message.note === "string" && message.note.length <= 1000 &&
+    (message.action !== "append_memo" || Boolean(message.note.trim())) &&
+    STAFFOPS_SOURCES.has(message.source) && typeof message.dryRun === "boolean";
+}
+
+async function saveStaffOpsTaskAction(message: StaffOpsTaskActionMessage): Promise<void> {
+  const res = (await chrome.runtime.sendNativeMessage(CLAUDEOPS_NATIVE_HOST, {
+    ...message,
+    via: "html-hub-extension"
+  })) as { ok?: boolean; error?: string } | undefined;
+  if (!res?.ok) throw new Error(res?.error ?? "native host rejected the Staff Ops action");
+}
+
 interface OpenEditorMessage {
   type: "open-editor-tab";
 }
@@ -216,7 +248,8 @@ type IncomingMessage =
   | OpenEditorMessage
   | ToggleQuickEditMessage
   | EditCurrentTabMessage
-  | ClaudeOpsDecisionMessage;
+  | ClaudeOpsDecisionMessage
+  | StaffOpsTaskActionMessage;
 
 chrome.runtime.onMessage.addListener((message: IncomingMessage, sender, sendResponse) => {
   if (sender.id !== chrome.runtime.id) return;
@@ -287,5 +320,16 @@ chrome.runtime.onMessage.addListener((message: IncomingMessage, sender, sendResp
     sendResponse({ ok: true });
     saveClaudeOpsDecision(message).catch((e) => console.warn("claudeops decision save failed", e));
     return;
+  }
+
+  if (message.type === "staffops-task-action") {
+    if (!validStaffOpsTaskAction(message)) {
+      sendResponse({ ok: false, error: "invalid Staff Ops task action payload" });
+      return;
+    }
+    saveStaffOpsTaskAction(message)
+      .then(() => sendResponse({ ok: true, actionId: message.actionId }))
+      .catch((e) => sendResponse({ ok: false, actionId: message.actionId, error: String(e) }));
+    return true;
   }
 });

@@ -8,7 +8,7 @@ import path from "node:path";
 
 const CHROME = "C:/Users/miyaz/tools/chrome-for-testing/chrome/win64-150.0.7871.115/chrome-win64/chrome.exe";
 const DIST = "C:/Users/miyaz/html-editor-extension/dist";
-const PROFILE = new URL("./e2e-profile", import.meta.url).pathname.replace(/^\/(\w):/, "$1:");
+const PROFILE = `C:/Users/miyaz/html-editor-extension/e2e/decision-profile-${process.pid}-${Date.now()}`;
 const PORT = 9299;
 const DASHBOARD_URL = "file:///C:/Users/miyaz/claude-ops/dashboard/index.html";
 const INBOX = "C:/Users/miyaz/Downloads/claude-ops-decisions";
@@ -51,7 +51,6 @@ async function evalIn(cdp, sessionId, expression, retries = 5) {
 const results = [];
 const check = (name, ok, detail = "") => { results.push({ name, ok, detail }); console.log(`${ok ? "PASS" : "FAIL"} ${name}${detail ? " — " + detail : ""}`); };
 
-fs.rmSync(PROFILE, { recursive: true, force: true });
 const before = new Set(fs.existsSync(INBOX) ? fs.readdirSync(INBOX) : []);
 
 const chrome = spawn(CHROME, [

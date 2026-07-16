@@ -130,6 +130,8 @@ export function ReportPanel() {
         showStatus(
           res.ok ? (res.count === 1 ? "畳みました" : "展開しました") : "「レポート」グループがありません"
         );
+      } else if (msg.type === "discard-report-tabs") {
+        showStatus(res.ok ? `${res.count ?? 0}件休止` : `失敗: ${res.error}`);
       } else {
         showStatus(res.ok ? `${label}: ${res.count ?? 0}件` : `失敗: ${res.error}`);
       }
@@ -256,6 +258,12 @@ export function ReportPanel() {
             onClick={() => void runTabOp({ type: "close-duplicate-tabs" }, "かぶり閉じ")}
           >
             かぶり閉じる
+          </button>
+          <button
+            title="レポートタブを全部休止する"
+            onClick={() => void runTabOp({ type: "discard-report-tabs" }, "")}
+          >
+            💤 全部休止
           </button>
           <button
             title="レポートタブを全部閉じる (やりなおしで戻せます)"

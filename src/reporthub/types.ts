@@ -34,6 +34,8 @@ export interface Settings {
   groupRules: GroupRule[];
   tabGroupTitle: string;
   tabGroupColor: chrome.tabGroups.ColorEnum;
+  /** Minutes before an inactive report tab is discarded. 0 disables automatic discard. */
+  autoDiscardMinutes: number;
   /** The Claude Ops daily dashboard — one-tap target for ☀ buttons. */
   dailyDashboardUrl: string;
 }
@@ -77,5 +79,6 @@ export const DEFAULT_SETTINGS: Settings = {
   ],
   tabGroupTitle: "レポート",
   tabGroupColor: "blue",
+  autoDiscardMinutes: 20,
   dailyDashboardUrl: "file:///C:/Users/miyaz/claude-ops/dashboard/index.html"
 };

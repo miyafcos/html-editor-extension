@@ -55,7 +55,8 @@ export default defineManifest({
     "tabs",
     "tabGroups",
     "history",
-    "webNavigation"
+    "webNavigation",
+    "alarms"
   ],
   host_permissions: ["<all_urls>"],
   web_accessible_resources: [

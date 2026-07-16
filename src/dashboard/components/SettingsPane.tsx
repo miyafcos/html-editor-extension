@@ -27,6 +27,7 @@ export default function SettingsPane({ onStatus }: Props) {
   const [rules, setRules] = useState<GroupRule[]>([]);
   const [tabTitle, setTabTitle] = useState("");
   const [tabColor, setTabColor] = useState<chrome.tabGroups.ColorEnum>("blue");
+  const [autoDiscardMinutes, setAutoDiscardMinutes] = useState(20);
   const [dailyUrl, setDailyUrl] = useState("");
 
   useEffect(() => {
@@ -34,6 +35,7 @@ export default function SettingsPane({ onStatus }: Props) {
     setRules(settings.groupRules.map((r) => ({ ...r })));
     setTabTitle(settings.tabGroupTitle);
     setTabColor(settings.tabGroupColor);
+    setAutoDiscardMinutes(settings.autoDiscardMinutes);
     setDailyUrl(settings.dailyDashboardUrl);
   }, [settings]);
 
@@ -45,6 +47,7 @@ export default function SettingsPane({ onStatus }: Props) {
     groupRules: rules.filter((r) => r.pattern.trim() && r.group.trim()),
     tabGroupTitle: tabTitle.trim() || "レポート",
     tabGroupColor: tabColor,
+    autoDiscardMinutes: Math.max(0, Number.isFinite(autoDiscardMinutes) ? autoDiscardMinutes : 0),
     dailyDashboardUrl: dailyUrl.trim() || DEFAULT_SETTINGS.dailyDashboardUrl
   });
 
@@ -71,6 +74,18 @@ export default function SettingsPane({ onStatus }: Props) {
           rows={5}
           value={exclude}
           onChange={(e) => setExclude(e.target.value)}
+        />
+      </section>
+
+      <section className={css.settingsSection}>
+        <h2>タブの自動休止</h2>
+        <p className={css.hint}>レポートタブを自動休止するまでの分数 (0=オフ)</p>
+        <input
+          type="number"
+          min="0"
+          step="1"
+          value={autoDiscardMinutes}
+          onChange={(e) => setAutoDiscardMinutes(Math.max(0, e.target.valueAsNumber || 0))}
         />
       </section>
 

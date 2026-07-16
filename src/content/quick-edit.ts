@@ -679,6 +679,8 @@ import { cleanPastedHtml, shouldClean } from "../editor/core/pasteClean";
     } else if (msg.type === "quick-edit:enable") {
       if (!editing) setup();
       sendResponse({ ok: true, editing });
+    } else if (msg.type === "quick-edit:status") {
+      sendResponse({ ok: true, editing });
     }
     return true;
   });

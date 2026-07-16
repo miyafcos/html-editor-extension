@@ -16,6 +16,9 @@ import {
 import {
   closeDuplicateTabs,
   closeReportTabs,
+  discardIdleReportTabs,
+  discardKey,
+  discardReportTabs,
   focusOrOpen,
   listReportTabs,
   openEntries,
@@ -32,6 +35,7 @@ const RH_TYPES = new Set<Msg["type"]>([
   "toggle-collapse",
   "close-duplicate-tabs",
   "close-report-tabs",
+  "discard-report-tabs",
   "undo-close",
   "focus-or-open",
   "open-hub-dashboard",
@@ -46,15 +50,50 @@ const reloadKey = (tabId: number) => `reload:${tabId}`;
 /** Set by onErrorOccurred; the error page still fires onUpdated(complete) with the
  *  original file URL, which must not be recorded as a successful visit. */
 const failKey = (tabId: number) => `navfail:${tabId}`;
+const AUTO_DISCARD_ALARM = "reporthub:auto-discard";
+const AUTO_DISCARD_PERIOD_MINUTES = 5;
+const replacementMigrations = new Map<number, Promise<void>>();
+
+async function ensureAutoDiscardAlarm(): Promise<void> {
+  const existing = await chrome.alarms.get(AUTO_DISCARD_ALARM);
+  if (existing?.periodInMinutes === AUTO_DISCARD_PERIOD_MINUTES) return;
+  await chrome.alarms.create(AUTO_DISCARD_ALARM, {
+    periodInMinutes: AUTO_DISCARD_PERIOD_MINUTES
+  });
+}
+
+async function migrateTabSessionKeys(addedTabId: number, removedTabId: number): Promise<void> {
+  const oldKeys = [
+    visitKey(removedTabId),
+    reloadKey(removedTabId),
+    failKey(removedTabId),
+    discardKey(removedTabId)
+  ];
+  const newKeys = [
+    visitKey(addedTabId),
+    reloadKey(addedTabId),
+    failKey(addedTabId),
+    discardKey(addedTabId)
+  ];
+  const stored = await chrome.storage.session.get(oldKeys);
+  const moved: Record<string, unknown> = {};
+  oldKeys.forEach((key, index) => {
+    if (Object.prototype.hasOwnProperty.call(stored, key)) moved[newKeys[index]] = stored[key];
+  });
+  if (Object.keys(moved).length) await chrome.storage.session.set(moved);
+  await chrome.storage.session.remove(oldKeys);
+}
 
 export function initReportHub(): void {
   void chrome.action.setBadgeBackgroundColor({ color: "#2563eb" });
   void updateBadge();
+  void ensureAutoDiscardAlarm();
 
   // Backfill once; the null check (not reason==="install") also covers the case
   // where Report Hub arrives via an *update* to the existing HTML Editor install.
   chrome.runtime.onInstalled.addListener(() => {
     void (async () => {
+      await ensureAutoDiscardAlarm();
       const meta = await getMeta();
       if (meta.backfillDoneAt == null) {
         await backfillFromHistory();
@@ -76,8 +115,32 @@ export function initReportHub(): void {
   });
 
   chrome.tabs.onRemoved.addListener((tabId) => {
-    void chrome.storage.session.remove([visitKey(tabId), reloadKey(tabId), failKey(tabId)]);
+    void chrome.storage.session.remove([
+      visitKey(tabId),
+      reloadKey(tabId),
+      failKey(tabId),
+      discardKey(tabId)
+    ]);
     void updateBadge();
+  });
+
+  chrome.tabs.onReplaced.addListener((addedTabId, removedTabId) => {
+    const migration = migrateTabSessionKeys(addedTabId, removedTabId).finally(() => {
+      if (replacementMigrations.get(addedTabId) === migration) {
+        replacementMigrations.delete(addedTabId);
+      }
+    });
+    replacementMigrations.set(addedTabId, migration);
+    void migration;
+    void updateBadge();
+  });
+
+  chrome.alarms.onAlarm.addListener((alarm) => {
+    if (alarm.name !== AUTO_DISCARD_ALARM) return;
+    void (async () => {
+      const settings = await getSettings();
+      if (settings.autoDiscardMinutes > 0) await discardIdleReportTabs(settings);
+    })();
   });
 
   chrome.webNavigation.onCommitted.addListener((details) => {
@@ -126,6 +189,9 @@ export function initReportHub(): void {
               break;
             case "close-report-tabs":
               sendResponse({ ok: true, count: await closeReportTabs(settings) });
+              break;
+            case "discard-report-tabs":
+              sendResponse({ ok: true, count: await discardReportTabs(settings) });
               break;
             case "undo-close": {
               const restored = await undoLastClose(settings);
@@ -194,10 +260,12 @@ async function handleTabUpdated(
   if (!isTargetFile(norm, settings)) return;
 
   if (changeInfo.status === "complete") {
+    await replacementMigrations.get(tabId);
     const sess = await chrome.storage.session.get([
       visitKey(tabId),
       reloadKey(tabId),
-      failKey(tabId)
+      failKey(tabId),
+      discardKey(tabId)
     ]);
     if (sess[failKey(tabId)] === norm.key) {
       await chrome.storage.session.remove([failKey(tabId), reloadKey(tabId)]);
@@ -205,9 +273,10 @@ async function handleTabUpdated(
     }
     const lastKey = sess[visitKey(tabId)] as string | undefined;
     const reloaded = Boolean(sess[reloadKey(tabId)]);
-    const countVisit = lastKey !== norm.key || reloaded;
+    const resumedFromDiscard = sess[discardKey(tabId)] === norm.key;
+    const countVisit = !resumedFromDiscard && (lastKey !== norm.key || reloaded);
     await chrome.storage.session.set({ [visitKey(tabId)]: norm.key });
-    await chrome.storage.session.remove(reloadKey(tabId));
+    await chrome.storage.session.remove([reloadKey(tabId), discardKey(tabId)]);
     await upsertVisit(
       {
         url: norm.url,

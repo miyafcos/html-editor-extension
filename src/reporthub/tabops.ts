@@ -4,6 +4,69 @@ import { isTargetFile, normalizeFileUrl } from "./url";
 
 /** storage.local key for the やりなおし (undo) snapshot of the last close op. */
 export const UNDO_KEY = "undo:lastClosed";
+export const discardKey = (tabId: number) => `tabdiscard:${tabId}`;
+
+const QUICK_EDIT_TIMEOUT_MS = 300;
+
+async function isQuickEditEnabled(tabId: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const response = await Promise.race([
+      chrome.tabs
+        .sendMessage(tabId, { type: "quick-edit:status" })
+        .catch(() => ({ editing: false })),
+      new Promise<{ editing: false }>((resolve) => {
+        timer = setTimeout(() => resolve({ editing: false }), QUICK_EDIT_TIMEOUT_MS);
+      })
+    ]);
+    return response?.editing === true;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function hasDiscardGuard(tab: chrome.tabs.Tab): boolean {
+  return Boolean(tab.active || tab.discarded || tab.pinned || tab.audible);
+}
+
+async function discardTarget(
+  target: ReportTab,
+  isStillEligible: (tab: chrome.tabs.Tab) => boolean
+): Promise<boolean> {
+  const tabId = target.tab.id;
+  if (tabId == null) return false;
+  try {
+    let tab = await chrome.tabs.get(tabId);
+    if (hasDiscardGuard(tab) || !isStillEligible(tab)) return false;
+    if (await isQuickEditEnabled(tabId)) return false;
+    // The user can activate/pin the tab, or audio can start, during the content-script probe.
+    tab = await chrome.tabs.get(tabId);
+    if (hasDiscardGuard(tab) || !isStillEligible(tab)) return false;
+    await chrome.storage.session.set({ [discardKey(tabId)]: target.norm.key });
+    try {
+      const discarded = (await chrome.tabs.discard(tabId)) as chrome.tabs.Tab | undefined;
+      if (!discarded?.discarded) {
+        await chrome.storage.session.remove(discardKey(tabId));
+        return false;
+      }
+      return true;
+    } catch (error) {
+      await chrome.storage.session.remove(discardKey(tabId));
+      console.warn("Failed to discard report tab", tabId, error);
+      return false;
+    }
+  } catch {
+    return false;
+  }
+}
+
+async function discardTargets(
+  targets: ReportTab[],
+  isStillEligible: (tab: chrome.tabs.Tab) => boolean = () => true
+): Promise<number> {
+  const results = await Promise.all(targets.map((target) => discardTarget(target, isStillEligible)));
+  return results.filter(Boolean).length;
+}
 
 async function saveUndoSnapshot(urls: string[], label: string): Promise<void> {
   if (!urls.length) return;
@@ -59,6 +122,7 @@ export async function organizeTabs(settings: Settings, collapse = false): Promis
   const windowId = targets[0].tab.windowId;
   const tabIds = targets.filter((t) => t.tab.windowId === windowId).map((t) => t.tab.id!);
   await groupTabIds(tabIds, windowId, settings, collapse);
+  if (collapse) await discardTargets(targets.filter((t) => tabIds.includes(t.tab.id!)));
   return tabIds.length;
 }
 
@@ -110,9 +174,38 @@ export async function toggleCollapse(settings: Settings): Promise<boolean | null
   });
   if (!groups.length) return null;
   const next = !groups[0].collapsed;
-  if (next) await collapseGroup(groups[0].id, win.id!);
-  else await chrome.tabGroups.update(groups[0].id, { collapsed: false });
+  if (next) {
+    const targets = (await listReportTabs(settings)).filter(
+      (target) => target.tab.groupId === groups[0].id
+    );
+    await collapseGroup(groups[0].id, win.id!);
+    await discardTargets(targets);
+  }
+  else {
+    await chrome.tabGroups.update(groups[0].id, { collapsed: false });
+  }
   return next;
+}
+
+/** Discard every safe report tab across all windows. */
+export async function discardReportTabs(settings: Settings): Promise<number> {
+  return discardTargets(await listReportTabs(settings, true));
+}
+
+/** Discard safe report tabs whose last access is older than the configured threshold. */
+export async function discardIdleReportTabs(
+  settings: Settings,
+  now = Date.now()
+): Promise<number> {
+  if (settings.autoDiscardMinutes <= 0) return 0;
+  const cutoff = now - settings.autoDiscardMinutes * 60_000;
+  const targets = (await listReportTabs(settings, true)).filter(
+    (target) => target.tab.lastAccessed != null && target.tab.lastAccessed <= cutoff
+  );
+  return discardTargets(
+    targets,
+    (tab) => tab.lastAccessed != null && tab.lastAccessed <= cutoff
+  );
 }
 
 /** Close duplicate tabs per normalized key, keeping the active or most recent one. */

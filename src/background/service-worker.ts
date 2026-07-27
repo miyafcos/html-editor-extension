@@ -110,127 +110,6 @@ interface DownloadMessage {
   filename: string;
 }
 
-interface ClaudeOpsDecisionMessage {
-  type: "claudeops-decision";
-  qid: string;
-  action: string;
-  note: string;
-  ts: string;
-}
-
-interface StaffOpsTaskActionMessage {
-  type: "staffops-task-action";
-  ref: string;
-  actionId: string;
-  action: "complete" | "append_memo";
-  note: string;
-  source: "claude-chat" | "dashboard" | "slack";
-  dryRun: boolean;
-  ts: string;
-}
-
-const CLAUDEOPS_QID_RE = /^q-\d{8}-\d{6}-[0-9a-f]{4}$/;
-const CLAUDEOPS_ACTIONS = new Set(["done", "dismissed", "note"]);
-const STAFFOPS_REF_RE = /^T-[A-Z2-7]{8,52}(?:-\d+)?$/;
-const STAFFOPS_ACTION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,119}$/;
-const STAFFOPS_ACTIONS = new Set(["complete", "append_memo"]);
-const STAFFOPS_SOURCES = new Set(["claude-chat", "dashboard", "slack"]);
-// Native messaging host (C:/Users/miyaz/claude-ops/bin/decisions_host.py) —
-// writes the decision file directly, no chrome.downloads involved
-const CLAUDEOPS_NATIVE_HOST = "com.claude_ops.decisions";
-
-/** UTF-8 safe base64 for a data: URL (no Blob URLs in MV3 service workers). */
-function toBase64Utf8(text: string): string {
-  const bytes = new TextEncoder().encode(text);
-  let binary = "";
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary);
-}
-
-function waitForDownloadEnd(id: number, timeoutMs = 8000): Promise<void> {
-  return new Promise((resolve) => {
-    const timer = setTimeout(done, timeoutMs);
-    function done() {
-      clearTimeout(timer);
-      chrome.downloads.onChanged.removeListener(onChanged);
-      resolve();
-    }
-    function onChanged(delta: chrome.downloads.DownloadDelta) {
-      if (delta.id === id && delta.state && delta.state.current !== "in_progress") done();
-    }
-    chrome.downloads.onChanged.addListener(onChanged);
-  });
-}
-
-/**
- * Persist a dashboard decision as a JSON file under
- * Downloads/claude-ops-decisions/. The Claude Ops watcher polls that folder
- * (15 min cycle), applies the decision to its queue, then deletes the file.
- *
- * Primary path (2026-07-14 ユーザー報告「JSONがダウンロードされる設計はやめて・
- * 反映だけされればいい」): a native messaging host writes the file directly —
- * no chrome.downloads, nothing in the download UI at all. If the host is not
- * registered (registry key absent), we fall back to a suppressed download
- * (UI disabled during the write + history entry erased afterwards).
- */
-async function saveClaudeOpsDecision(message: ClaudeOpsDecisionMessage): Promise<void> {
-  const payload = {
-    qid: message.qid,
-    action: message.action,
-    note: message.note,
-    ts: message.ts,
-    via: "html-hub-extension"
-  };
-  try {
-    const res = (await chrome.runtime.sendNativeMessage(CLAUDEOPS_NATIVE_HOST, payload)) as
-      | { ok?: boolean; error?: string }
-      | undefined;
-    if (res?.ok) return;
-    throw new Error(res?.error ?? "native host rejected the decision");
-  } catch (e) {
-    console.warn("claudeops native host unavailable — silent download fallback", e);
-  }
-  const body = JSON.stringify(payload);
-  try {
-    await chrome.downloads.setUiOptions({ enabled: false });
-  } catch {
-    /* downloads.ui unavailable — fall through, worst case the shelf blips */
-  }
-  try {
-    const id = await chrome.downloads.download({
-      url: `data:application/json;base64,${toBase64Utf8(body)}`,
-      filename: `claude-ops-decisions/decision-${message.qid}-${Date.now()}.json`,
-      saveAs: false,
-      conflictAction: "uniquify"
-    });
-    await waitForDownloadEnd(id);
-    await chrome.downloads.erase({ id });
-  } finally {
-    try {
-      await chrome.downloads.setUiOptions({ enabled: true });
-    } catch {
-      /* ignore */
-    }
-  }
-}
-
-function validStaffOpsTaskAction(message: StaffOpsTaskActionMessage): boolean {
-  return STAFFOPS_REF_RE.test(message.ref) &&
-    STAFFOPS_ACTION_ID_RE.test(message.actionId) &&
-    STAFFOPS_ACTIONS.has(message.action) &&
-    typeof message.note === "string" && message.note.length <= 1000 &&
-    (message.action !== "append_memo" || Boolean(message.note.trim())) &&
-    STAFFOPS_SOURCES.has(message.source) && typeof message.dryRun === "boolean";
-}
-
-async function saveStaffOpsTaskAction(message: StaffOpsTaskActionMessage): Promise<void> {
-  const res = (await chrome.runtime.sendNativeMessage(CLAUDEOPS_NATIVE_HOST, {
-    ...message,
-    via: "html-hub-extension"
-  })) as { ok?: boolean; error?: string } | undefined;
-  if (!res?.ok) throw new Error(res?.error ?? "native host rejected the Staff Ops action");
-}
-
 interface OpenEditorMessage {
   type: "open-editor-tab";
 }
@@ -247,9 +126,7 @@ type IncomingMessage =
   | DownloadMessage
   | OpenEditorMessage
   | ToggleQuickEditMessage
-  | EditCurrentTabMessage
-  | ClaudeOpsDecisionMessage
-  | StaffOpsTaskActionMessage;
+  | EditCurrentTabMessage;
 
 chrome.runtime.onMessage.addListener((message: IncomingMessage, sender, sendResponse) => {
   if (sender.id !== chrome.runtime.id) return;
@@ -305,31 +182,6 @@ chrome.runtime.onMessage.addListener((message: IncomingMessage, sender, sendResp
       .download({ url: message.url, filename: message.filename, saveAs: true })
       .then((id) => sendResponse({ ok: true, id }))
       .catch((e) => sendResponse({ ok: false, error: String(e) }));
-    return true;
-  }
-
-  if (message.type === "claudeops-decision") {
-    if (!CLAUDEOPS_QID_RE.test(message.qid) || !CLAUDEOPS_ACTIONS.has(message.action)) {
-      sendResponse({ ok: false, error: "invalid decision payload" });
-      return;
-    }
-    // Respond immediately: downloads.download can take seconds on SW cold
-    // start, and the dashboard's optimistic UI waits on this ack. The decision
-    // file is fire-and-forget; the watcher-rendered queue state is the truth
-    // and a failed write resurfaces the card after the optimistic TTL.
-    sendResponse({ ok: true });
-    saveClaudeOpsDecision(message).catch((e) => console.warn("claudeops decision save failed", e));
-    return;
-  }
-
-  if (message.type === "staffops-task-action") {
-    if (!validStaffOpsTaskAction(message)) {
-      sendResponse({ ok: false, error: "invalid Staff Ops task action payload" });
-      return;
-    }
-    saveStaffOpsTaskAction(message)
-      .then(() => sendResponse({ ok: true, actionId: message.actionId }))
-      .catch((e) => sendResponse({ ok: false, actionId: message.actionId, error: String(e) }));
     return true;
   }
 });

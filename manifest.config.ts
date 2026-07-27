@@ -32,16 +32,6 @@ export default defineManifest({
       js: ["src/content/quick-edit.ts"],
       matches: ["file:///*", "*://*/*.html*", "*://*/*.htm*"],
       run_at: "document_idle"
-    },
-    {
-      js: ["src/content/dashboard-actions.ts"],
-      matches: ["file:///*claude-ops/dashboard/*"],
-      run_at: "document_idle"
-    },
-    {
-      js: ["src/content/report-nav.ts"],
-      matches: ["file:///*"],
-      run_at: "document_idle"
     }
   ],
   permissions: [
@@ -49,8 +39,6 @@ export default defineManifest({
     "activeTab",
     "sidePanel",
     "downloads",
-    "downloads.ui",
-    "nativeMessaging",
     "scripting",
     "tabs",
     "tabGroups",

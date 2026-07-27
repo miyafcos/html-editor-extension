@@ -180,19 +180,6 @@ export function ReportPanel() {
   return (
     <div className={css.app}>
       <div className={css.header}>
-        <button
-          className={css.dailyBtn}
-          title="Claude Ops デイリーダッシュボードを開く (開いていればそのタブへ)"
-          onClick={async () => {
-            const res = await sendMsg({ type: "focus-or-open" }).catch((e) => ({
-              ok: false,
-              error: String(e)
-            }));
-            showStatus(res?.ok ? "☀ デイリーを開きました" : `デイリーを開けません: ${res?.error ?? "応答なし"}`);
-          }}
-        >
-          ☀ 今日のデイリー
-        </button>
         <input
           className={css.search}
           type="search"

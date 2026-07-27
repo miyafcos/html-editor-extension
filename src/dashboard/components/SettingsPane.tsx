@@ -1,7 +1,6 @@
 import { useEffect, useState } from "react";
 import { recomputeGroups, saveSettings } from "../../reporthub/repo";
 import type { GroupRule, Settings } from "../../reporthub/types";
-import { DEFAULT_SETTINGS } from "../../reporthub/types";
 import { useLibraryStore } from "../../reporthub/libraryStore";
 import css from "../dashboard.module.css";
 
@@ -28,7 +27,6 @@ export default function SettingsPane({ onStatus }: Props) {
   const [tabTitle, setTabTitle] = useState("");
   const [tabColor, setTabColor] = useState<chrome.tabGroups.ColorEnum>("blue");
   const [autoDiscardMinutes, setAutoDiscardMinutes] = useState(20);
-  const [dailyUrl, setDailyUrl] = useState("");
 
   useEffect(() => {
     setExclude(settings.excludePatterns.join("\n"));
@@ -36,7 +34,6 @@ export default function SettingsPane({ onStatus }: Props) {
     setTabTitle(settings.tabGroupTitle);
     setTabColor(settings.tabGroupColor);
     setAutoDiscardMinutes(settings.autoDiscardMinutes);
-    setDailyUrl(settings.dailyDashboardUrl);
   }, [settings]);
 
   const buildSettings = (): Settings => ({
@@ -47,8 +44,7 @@ export default function SettingsPane({ onStatus }: Props) {
     groupRules: rules.filter((r) => r.pattern.trim() && r.group.trim()),
     tabGroupTitle: tabTitle.trim() || "レポート",
     tabGroupColor: tabColor,
-    autoDiscardMinutes: Math.max(0, Number.isFinite(autoDiscardMinutes) ? autoDiscardMinutes : 0),
-    dailyDashboardUrl: dailyUrl.trim() || DEFAULT_SETTINGS.dailyDashboardUrl
+    autoDiscardMinutes: Math.max(0, Number.isFinite(autoDiscardMinutes) ? autoDiscardMinutes : 0)
   });
 
   const save = async (recompute: boolean) => {
@@ -149,19 +145,6 @@ export default function SettingsPane({ onStatus }: Props) {
             </select>
           </label>
         </div>
-      </section>
-
-      <section className={css.settingsSection}>
-        <h2>☀ デイリーダッシュボード</h2>
-        <p className={css.hint}>
-          パネルの「☀ 今日のデイリー」と各レポートの浮きボタンが開く URL。
-        </p>
-        <input
-          className={css.settingsArea}
-          value={dailyUrl}
-          placeholder={DEFAULT_SETTINGS.dailyDashboardUrl}
-          onChange={(e) => setDailyUrl(e.target.value)}
-        />
       </section>
 
       <div className={css.settingsBtns}>

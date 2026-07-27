@@ -19,7 +19,6 @@ import {
   discardIdleReportTabs,
   discardKey,
   discardReportTabs,
-  focusOrOpen,
   listReportTabs,
   openEntries,
   openTabSet,
@@ -37,7 +36,6 @@ const RH_TYPES = new Set<Msg["type"]>([
   "close-report-tabs",
   "discard-report-tabs",
   "undo-close",
-  "focus-or-open",
   "open-hub-dashboard",
   "open-entries",
   "save-tabset",
@@ -196,20 +194,6 @@ export function initReportHub(): void {
             case "undo-close": {
               const restored = await undoLastClose(settings);
               sendResponse({ ok: restored !== null, count: restored ?? 0 });
-              break;
-            }
-            case "focus-or-open": {
-              const url = msg.url || settings.dailyDashboardUrl;
-              const norm = normalizeFileUrl(url);
-              try {
-                await focusOrOpen(url, norm?.key ?? url.toLowerCase(), settings);
-              } catch (e) {
-                // whatever went wrong with focusing, the user asked for the
-                // page — a fresh tab is always deliverable
-                console.warn("focusOrOpen failed; opening new tab", e);
-                await chrome.tabs.create({ url });
-              }
-              sendResponse({ ok: true, count: 1 });
               break;
             }
             case "open-hub-dashboard":

@@ -10,25 +10,6 @@
   padding: 10px 10px 6px;
 }
 
-.dailyBtn {
-  display: block;
-  width: 100%;
-  box-sizing: border-box;
-  margin-bottom: 6px;
-  padding: 9px 10px;
-  font-size: 13px;
-  font-weight: 700;
-  border: none;
-  border-radius: 8px;
-  background: #b45309;
-  color: #fff;
-  cursor: pointer;
-}
-
-.dailyBtn:hover {
-  background: #92400e;
-}
-
 .search {
   width: 100%;
   box-sizing: border-box;

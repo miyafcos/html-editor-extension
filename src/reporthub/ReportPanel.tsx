@@ -221,6 +221,18 @@ export function ReportPanel() {
             >
               <span className={css.tabDot} />
               <span className={css.tabTitle}>{tab.title || fileName(norm.path)}</span>
+              <button
+                className={css.setDel}
+                title="このタブを閉じる (ファイルは消えません)"
+                onClick={(ev) => {
+                  ev.stopPropagation();
+                  if (tab.id != null) {
+                    void chrome.tabs.remove(tab.id).then(() => void refreshTabs());
+                  }
+                }}
+              >
+                ✕
+              </button>
             </div>
           ))
         )}

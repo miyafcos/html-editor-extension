@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import type { FocusEvent as ReactFocusEvent, MouseEvent as ReactMouseEvent } from "react";
 import {
   NEW_TAB_INDEX_KEY,
   SERVICE_RULES_KEY,
@@ -30,8 +31,10 @@ import {
   inferService,
   matchServiceRule,
   normalizeTarget,
+  parentDir,
   serviceHostname
 } from "../reporthub/url";
+import { getHtmlPreview, type HtmlPreviewData } from "./preview";
 import { S } from "./strings";
 
 type Kind = ReportEntry["kind"];
@@ -50,12 +53,26 @@ interface ToastState {
   undo?: { entry: HubEntry; ts: number };
 }
 
+interface PreviewState {
+  entry: HubEntry;
+  serviceRule: ServiceRule | null;
+  target: HTMLElement;
+  anchorTop: number;
+  left: number;
+  top: number;
+  html?: HtmlPreviewData;
+}
+
 const KINDS: Kind[] = ["web", "html", "pdf"];
 const KIND_FILTERS: KindFilter[] = ["all", ...KINDS];
 const BANDS: Band[] = ["open", "recent", "later"];
 const COLLAPSIBLE_BANDS: CollapsibleBand[] = ["open", "recent", "bookmarks", "later"];
 const SILENT_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
 const LAYOUT_STORAGE_KEY = "tabhub:layout";
+const PREVIEW_WIDTH = 340;
+const PREVIEW_GAP = 10;
+const PREVIEW_EDGE = 8;
+const PREVIEW_HOVER_DELAY_MS = 200;
 
 interface LayoutState {
   kind: KindFilter;
@@ -360,10 +377,19 @@ function AppRow({
       data-service-id={serviceRule?.id ?? "other"}
       role="button"
       tabIndex={0}
-      title={`${entry.title || fileName(entry.path)}\n${entry.url}`}
       aria-label={`${openLabel}: ${entry.title}`}
       onClick={() => onOpen(entry, band)}
       onKeyDown={(event) => {
+        if (event.key === "ArrowUp" || event.key === "ArrowDown") {
+          const rows = [...document.querySelectorAll<HTMLElement>(".hub-row")];
+          const index = rows.indexOf(event.currentTarget);
+          const target = rows[index + (event.key === "ArrowDown" ? 1 : -1)];
+          if (target) {
+            event.preventDefault();
+            target.focus();
+          }
+          return;
+        }
         if (event.key === "Enter" || event.key === " ") {
           event.preventDefault();
           onOpen(entry, band);
@@ -423,7 +449,83 @@ export function App() {
   const [layout, setLayout] = useState<LayoutState>(readLayoutState);
   const [collapsedGroups, setCollapsedGroups] = useState<string[]>([]);
   const [tabstripBusy, setTabstripBusy] = useState(false);
+  const [preview, setPreview] = useState<PreviewState | null>(null);
   const fullLoadRef = useRef<Promise<NewTabIndexEntry[]> | null>(null);
+  const previewCardRef = useRef<HTMLElement>(null);
+  const previewTimerRef = useRef<{ id: number; entryId: string } | null>(null);
+  const previewEntriesRef = useRef<HubEntry[]>([]);
+
+  const clearPreviewTimer = useCallback((entryId?: string) => {
+    if (previewTimerRef.current == null) return;
+    if (entryId && previewTimerRef.current.entryId !== entryId) return;
+    window.clearTimeout(previewTimerRef.current.id);
+    previewTimerRef.current = null;
+  }, []);
+
+  const showPreview = useCallback((entry: HubEntry, serviceRule: ServiceRule | null, target: HTMLElement) => {
+    clearPreviewTimer();
+    if (!target.isConnected) return;
+    const rect = target.getBoundingClientRect();
+    const preferredLeft = rect.right + PREVIEW_GAP + PREVIEW_WIDTH <= window.innerWidth - PREVIEW_EDGE
+      ? rect.right + PREVIEW_GAP
+      : rect.left - PREVIEW_GAP - PREVIEW_WIDTH;
+    const left = Math.min(
+      Math.max(PREVIEW_EDGE, preferredLeft),
+      Math.max(PREVIEW_EDGE, window.innerWidth - PREVIEW_WIDTH - PREVIEW_EDGE)
+    );
+    setPreview({ entry, serviceRule, target, anchorTop: rect.top, left, top: Math.max(PREVIEW_EDGE, rect.top) });
+    if (entry.kind === "html") {
+      void getHtmlPreview(entry.id, entry.url).then((html) => {
+        setPreview((current) => current?.entry.id === entry.id ? { ...current, html } : current);
+      });
+    }
+  }, [clearPreviewTimer]);
+
+  const schedulePreview = useCallback((entry: HubEntry, serviceRule: ServiceRule | null, target: HTMLElement) => {
+    clearPreviewTimer();
+    const id = window.setTimeout(() => {
+      previewTimerRef.current = null;
+      if (!target.isConnected || !target.matches(":hover")) return;
+      showPreview(entry, serviceRule, target);
+    }, PREVIEW_HOVER_DELAY_MS);
+    previewTimerRef.current = { id, entryId: entry.id };
+  }, [clearPreviewTimer, showPreview]);
+
+  const hidePreview = useCallback((entryId: string, keepVisible: boolean) => {
+    clearPreviewTimer(entryId);
+    if (keepVisible) return;
+    setPreview((current) => current?.entry.id === entryId ? null : current);
+  }, [clearPreviewTimer]);
+
+  useLayoutEffect(() => {
+    if (!preview || !previewCardRef.current) return;
+    const height = previewCardRef.current.getBoundingClientRect().height;
+    const maxTop = Math.max(PREVIEW_EDGE, window.innerHeight - height - PREVIEW_EDGE);
+    const top = Math.min(Math.max(PREVIEW_EDGE, preview.anchorTop), maxTop);
+    if (top === preview.top) return;
+    setPreview((current) => current?.entry.id === preview.entry.id ? { ...current, top } : current);
+  }, [preview]);
+
+  const previewEntryId = preview?.entry.id;
+  const previewTarget = preview?.target;
+  useEffect(() => {
+    if (!previewEntryId || !previewTarget) return;
+    const hide = () => setPreview((current) => current?.entry.id === previewEntryId ? null : current);
+    const hideIfDetached = () => {
+      if (!previewTarget.isConnected) hide();
+    };
+    const observer = new MutationObserver(hideIfDetached);
+    observer.observe(document.body, { childList: true, subtree: true });
+    window.addEventListener("resize", hide);
+    window.addEventListener("scroll", hide, true);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", hide);
+      window.removeEventListener("scroll", hide, true);
+    };
+  }, [previewEntryId, previewTarget]);
+
+  useEffect(() => () => clearPreviewTimer(), [clearPreviewTimer]);
 
   const loadIndex = useCallback(async () => {
     const next = (await getNewTabIndex()) ?? (await rebuildNewTabIndex());
@@ -585,6 +687,7 @@ export function App() {
     () => merged.filter((entry) => BANDS.some((band) => visibleByBand(entry, band))),
     [merged, visibleByBand]
   );
+  previewEntriesRef.current = visibleEntries;
 
   const kindCounts = useMemo(
     () => ({
@@ -608,6 +711,39 @@ export function App() {
     (entry: HubEntry) => entry.kind === "web" ? getRuleForUrl(entry.url) : fallbackServiceRule,
     [fallbackServiceRule, getRuleForUrl]
   );
+  const getPreviewRule = useCallback(
+    (entry: HubEntry) => /^https?:\/\//i.test(entry.url) ? getRuleForUrl(entry.url) : getRuleForEntry(entry),
+    [getRuleForEntry, getRuleForUrl]
+  );
+  const previewRow = useCallback((target: EventTarget | null) => {
+    return target instanceof Element ? target.closest<HTMLElement>(".hub-row[data-entry-id]") : null;
+  }, []);
+  const previewEntryForRow = useCallback((row: HTMLElement) => {
+    const entryId = row.dataset.entryId;
+    return entryId ? previewEntriesRef.current.find((entry) => entry.id === entryId) ?? null : null;
+  }, []);
+  const handlePreviewMouseOver = useCallback((event: ReactMouseEvent<HTMLElement>) => {
+    const row = previewRow(event.target);
+    if (!row || (event.relatedTarget instanceof Node && row.contains(event.relatedTarget))) return;
+    const entry = previewEntryForRow(row);
+    if (entry) schedulePreview(entry, getPreviewRule(entry), row);
+  }, [getPreviewRule, previewEntryForRow, previewRow, schedulePreview]);
+  const handlePreviewMouseOut = useCallback((event: ReactMouseEvent<HTMLElement>) => {
+    const row = previewRow(event.target);
+    if (!row || (event.relatedTarget instanceof Node && row.contains(event.relatedTarget))) return;
+    hidePreview(row.dataset.entryId ?? "", row.contains(document.activeElement));
+  }, [hidePreview, previewRow]);
+  const handlePreviewFocus = useCallback((event: ReactFocusEvent<HTMLElement>) => {
+    const row = previewRow(event.target);
+    if (!row || (event.relatedTarget instanceof Node && row.contains(event.relatedTarget))) return;
+    const entry = previewEntryForRow(row);
+    if (entry) showPreview(entry, getPreviewRule(entry), row);
+  }, [getPreviewRule, previewEntryForRow, previewRow, showPreview]);
+  const handlePreviewBlur = useCallback((event: ReactFocusEvent<HTMLElement>) => {
+    const row = previewRow(event.target);
+    if (!row || (event.relatedTarget instanceof Node && row.contains(event.relatedTarget))) return;
+    hidePreview(row.dataset.entryId ?? "", row.matches(":hover"));
+  }, [hidePreview, previewRow]);
 
   const kindFilteredEntries = useMemo(
     () =>
@@ -934,9 +1070,18 @@ export function App() {
                       entry={entry}
                       band={band}
                       serviceRule={getRuleForEntry(entry)}
-                      onOpen={(item, itemBand) => void openEntry(item, itemBand)}
-                      onLater={(item) => void moveLater(item)}
-                      onClose={(item, itemBand) => void closeEntry(item, itemBand)}
+                      onOpen={(item, itemBand) => {
+                        hidePreview(item.id, false);
+                        void openEntry(item, itemBand);
+                      }}
+                      onLater={(item) => {
+                        hidePreview(item.id, false);
+                        void moveLater(item);
+                      }}
+                      onClose={(item, itemBand) => {
+                        hidePreview(item.id, false);
+                        void closeEntry(item, itemBand);
+                      }}
                     />
                   ))}
                 </section>
@@ -948,8 +1093,36 @@ export function App() {
     );
   };
 
+  const previewShapeParts: string[] = [];
+  const previewShape = preview?.html?.shape;
+  if (previewShape?.headings) previewShapeParts.push(S.preview.shapeHeadings(previewShape.headings));
+  if (previewShape?.tables) previewShapeParts.push(S.preview.shapeTables(previewShape.tables, previewShape.maxTableRows));
+  if (previewShape && (previewShape.ok || previewShape.warn || previewShape.ng)) {
+    previewShapeParts.push(S.preview.shapeChips(previewShape.ok, previewShape.warn, previewShape.ng));
+  }
+  if (previewShape?.figures) previewShapeParts.push(S.preview.shapeFigures(previewShape.figures));
+
+  const previewDays = preview ? Math.max(0, Math.floor((Date.now() - preview.entry.lastSeenAt) / (24 * 60 * 60 * 1000))) : 0;
+  const previewStatuses = preview
+    ? [
+        S.preview.ago(previewDays),
+        S.preview.visits(preview.entry.visitCount),
+        preview.entry.pinned || preview.entry.chromePinned ? `📌 ${S.preview.pinned}` : null,
+        preview.entry.later ? `🕐 ${S.preview.later}` : null
+      ].filter((value): value is string => value !== null)
+    : [];
+  const previewIsRemote = preview ? /^https?:\/\//i.test(preview.entry.url) : false;
+
   return (
-    <main className="hub-shell" data-testid="hub-shell" data-ready={settings && serviceRules ? "true" : "false"}>
+    <main
+      className="hub-shell"
+      data-testid="hub-shell"
+      data-ready={settings && serviceRules ? "true" : "false"}
+      onMouseOver={handlePreviewMouseOver}
+      onMouseOut={handlePreviewMouseOut}
+      onFocus={handlePreviewFocus}
+      onBlur={handlePreviewBlur}
+    >
       <header className="hub-header">
         <div className="hub-top">
           <label className="search-box">
@@ -1124,6 +1297,42 @@ export function App() {
           {S.footer.settings}
         </button>
       </footer>
+
+      {preview && (
+        <aside
+          ref={previewCardRef}
+          className="preview-card"
+          data-testid="preview-card"
+          data-preview-entry-id={preview.entry.id}
+          role="tooltip"
+          style={{ left: preview.left, top: preview.top }}
+        >
+          <h2 data-testid="preview-title">{preview.entry.title || fileName(preview.entry.path)}</h2>
+          <div className="preview-meta preview-source" data-testid="preview-source">
+            {previewIsRemote ? (
+              <>
+                <span className="preview-badge">
+                  <span className="preview-badge-dot" style={ruleColorStyle(preview.serviceRule)} aria-hidden="true" />
+                  {preview.serviceRule?.label ?? S.service.other}
+                </span>
+                <span>{serviceHostname(preview.entry.url) ?? preview.entry.path}</span>
+              </>
+            ) : (
+              <>
+                <span className="preview-badge">{preview.entry.group}</span>
+                <span>{parentDir(preview.entry.path)}</span>
+              </>
+            )}
+          </div>
+          <div className="preview-meta" data-testid="preview-activity">{previewStatuses.join(" · ")}</div>
+          {preview.entry.kind === "html" && preview.html?.excerpt && (
+            <p className="preview-excerpt" data-testid="preview-excerpt">{preview.html.excerpt}</p>
+          )}
+          {preview.entry.kind === "html" && previewShapeParts.length > 0 && (
+            <div className="preview-shape" data-testid="preview-shape">{previewShapeParts.join(" · ")}</div>
+          )}
+        </aside>
+      )}
 
       {toast && (
         <aside className="toast" role="status">

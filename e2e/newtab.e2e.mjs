@@ -10,6 +10,8 @@ const FILE_HTML = "file:///C:/Users/miyaz/html-editor-extension/src/newtab/index
 const WEB_URL = "https://example.com/";
 const PDF_URL = "https://example.com/y.pdf";
 const REPEAT_URL = `https://example.com/?hub-e2e=${Date.now()}`;
+// Commit 7b4e5da, same 140-row fixture and performance.now() sample: 358.7, 336.0, 345.9 ms (median 345.9).
+const V013_DENSE_RENDER_BASELINE_MS = 345.9;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -131,11 +133,12 @@ async function openTab(cdp, controlSession, url, active = false) {
   return tab.id;
 }
 
-async function openHub(cdp, control, extensionId) {
+async function openHub(cdp, control, extensionId, { initScript = "" } = {}) {
   void control;
   const { targetId } = await cdp.send("Target.createTarget", { url: "about:blank" });
   const sessionId = await attach(cdp, targetId);
   await cdp.send("Page.enable", {}, sessionId);
+  if (initScript) await cdp.send("Page.addScriptToEvaluateOnNewDocument", { source: initScript }, sessionId);
   await cdp.send("Page.navigate", { url: "chrome://newtab/" }, sessionId);
   const ready = await waitFor(() =>
     evalIn(
@@ -258,12 +261,33 @@ async function resetHubFixture(cdp, controlSession, { clearRules = false, closeT
     `(async () => {
       localStorage.removeItem('tabhub:layout');
       const all = await chrome.storage.local.get(null);
-      const keys = Object.keys(all).filter((key) => key.startsWith('entry:') || key === 'index:newtab' || key === 'index:panel'${clearRules ? " || key === 'serviceRules'" : ""});
+      const keys = Object.keys(all).filter((key) => key.startsWith('entry:') || key.startsWith('excerpt:') || key === 'index:newtab' || key === 'index:panel'${clearRules ? " || key === 'serviceRules'" : ""});
       if (keys.length) await chrome.storage.local.remove(keys);
       ${closeTabs ? "const current = await chrome.tabs.getCurrent(); const tabs = await chrome.tabs.query({}); const ids = tabs.filter((tab) => tab.id !== current.id && !tab.url?.startsWith('chrome://')).map((tab) => tab.id); if (ids.length) await chrome.tabs.remove(ids);" : ""}
       return true;
     })()`
   );
+}
+
+async function hoverEntry(cdp, sessionId, entryId) {
+  const point = await waitFor(() =>
+    evalIn(
+      cdp,
+      sessionId,
+      `(() => {
+        const rect = document.querySelector('[data-entry-id=${JSON.stringify(entryId)}]')?.getBoundingClientRect();
+        return rect?.width > 0 && rect?.height > 0 ? { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 } : null;
+      })()`,
+      1
+    )
+  );
+  if (!point) return false;
+  await cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: point.x, y: point.y }, sessionId);
+  return true;
+}
+
+async function leaveHubRows(cdp, sessionId) {
+  await cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: 1, y: 1 }, sessionId);
 }
 
 async function stopProcessTree(process) {
@@ -1316,7 +1340,7 @@ try {
     )
   );
   check(
-    "x. five singleton dev hosts stay in one service group",
+    "x0. five singleton dev hosts stay in one service group",
     devServiceGroupState?.length === 1 &&
       devServiceGroupState[0].name === S.service.dev &&
       devServiceGroupState[0].count === 5 &&
@@ -1374,7 +1398,7 @@ try {
   const splitHostIds = devHostSplitEntries.slice(0, 4).map((entry) => entry.id).sort();
   const devRemainderIds = devHostSplitEntries.slice(4).map((entry) => entry.id).sort();
   check(
-    "y. frequent dev host splits from the service remainder",
+    "y0. frequent dev host splits from the service remainder",
     devHostSplitState?.length === 2 &&
       splitHostGroup?.count === 4 &&
       JSON.stringify(splitHostGroup.ids.sort()) === JSON.stringify(splitHostIds) &&
@@ -1382,6 +1406,262 @@ try {
       JSON.stringify(devRemainderGroup.ids.sort()) === JSON.stringify(devRemainderIds) &&
       !devHostSplitState.some((group) => group.name === S.group.misc),
     JSON.stringify(devHostSplitState)
+  );
+
+  await resetHubFixture(cdp, control.sessionId);
+  const previewUrls = {
+    callout: "file:///C:/e2e/preview/callout.html",
+    paragraph: "file:///C:/e2e/preview/paragraph.html",
+    timeout: "file:///C:/e2e/preview/timeout.html",
+    guardedWeb: "https://example.com/e2e/inconsistent-kind.html",
+    web: "https://example.com/e2e/preview-web",
+    pdf: "https://drive.google.com/e2e/preview-document.pdf"
+  };
+  const calloutText = "The decisive conclusion belongs in the first readable callout.";
+  const paragraphText = "This paragraph is deliberately longer than eighty characters so the preview parser selects the first substantial paragraph immediately following the heading.";
+  const previewHtml = {
+    [previewUrls.callout]: `<!doctype html><title>Callout fallback title</title><nav><div class="callout">Hidden navigation callout</div></nav><div class="callout">${calloutText}</div><h2>One</h2><h2>Two</h2><table><tr><td>1</td></tr><tr><td>2</td></tr><tr><td>3</td></tr></table><span class="chip ok">A</span><span class="chip ok">B</span><span class="chip warn">C</span><span class="chip ng">D</span><svg></svg>`,
+    [previewUrls.paragraph]: `<!doctype html><title>Paragraph fallback title</title><h2>Summary</h2><p>${paragraphText}</p>`
+  };
+  const previewEntries = [
+    fixtureEntry({ id: "preview-callout", url: previewUrls.callout, kind: "html", group: "preview-case", title: "A complete preview title that is intentionally longer than the dense row can display" }),
+    fixtureEntry({ id: "preview-paragraph", url: previewUrls.paragraph, kind: "html", group: "preview-case", title: "Paragraph preview" }),
+    fixtureEntry({ id: "preview-timeout", url: previewUrls.timeout, kind: "html", group: "preview-case", title: "Timeout preview" }),
+    fixtureEntry({ id: "preview-guarded-web", url: previewUrls.guardedWeb, kind: "html", group: "preview-case", title: "Guarded inconsistent preview" }),
+    fixtureEntry({ id: "preview-web", url: previewUrls.web, kind: "web", service: "other", title: "Web preview" }),
+    fixtureEntry({ id: "preview-pdf", url: previewUrls.pdf, kind: "pdf", group: "preview-case", title: "PDF preview" })
+  ];
+  previewEntries[0].visitCount = 7;
+  previewEntries[0].pinned = true;
+  await evalIn(
+    cdp,
+    control.sessionId,
+    `chrome.storage.local.set({ ...${JSON.stringify(entryRecord(previewEntries))}, 'index:newtab': ${JSON.stringify(previewEntries)} })`
+  );
+  const previewInitScript = `(() => {
+    const fixtures = ${JSON.stringify(previewHtml)};
+    const timeoutUrl = ${JSON.stringify(previewUrls.timeout)};
+    const nativeFetch = globalThis.fetch.bind(globalThis);
+    globalThis.__previewFetchState = { calls: [] };
+    globalThis.fetch = (input, init = {}) => {
+      const url = typeof input === 'string' ? input : input.url;
+      const call = { url, hasSignal: Boolean(init.signal), at: performance.now() };
+      globalThis.__previewFetchState.calls.push(call);
+      if (url === timeoutUrl) {
+        return new Promise((_resolve, reject) => {
+          init.signal?.addEventListener('abort', () => {
+            call.abortedAt = performance.now();
+            reject(init.signal.reason ?? new DOMException('Aborted', 'AbortError'));
+          }, { once: true });
+        });
+      }
+      if (Object.hasOwn(fixtures, url)) return Promise.resolve(new Response(fixtures[url], { status: 200 }));
+      return nativeFetch(input, init);
+    };
+  })();`;
+  hub = await openHub(cdp, control, extensionId, { initScript: previewInitScript });
+  await sleep(250);
+  const initialPreviewFetches = await evalIn(cdp, hub.sessionId, "globalThis.__previewFetchState.calls.length", 1);
+  check("x. initial render performs zero fetches", initialPreviewFetches === 0, `fetches=${initialPreviewFetches}`);
+
+  const quickHoverReady = await hoverEntry(cdp, hub.sessionId, "preview-callout");
+  await sleep(100);
+  await leaveHubRows(cdp, hub.sessionId);
+  const quickHoverState = await evalIn(
+    cdp,
+    hub.sessionId,
+    "({ card: Boolean(document.querySelector('[data-testid=\"preview-card\"]')), fetches: globalThis.__previewFetchState.calls.length })",
+    1
+  );
+  await hoverEntry(cdp, hub.sessionId, "preview-callout");
+  await sleep(225);
+  const sustainedHoverState = await evalIn(
+    cdp,
+    hub.sessionId,
+    "({ card: Boolean(document.querySelector('[data-testid=\"preview-card\"]')), fetches: globalThis.__previewFetchState.calls.length })",
+    1
+  );
+  check(
+    "y. 100ms hover does not fire and 200ms hover shows the card",
+    quickHoverReady && !quickHoverState.card && quickHoverState.fetches === 0 && sustainedHoverState.card && sustainedHoverState.fetches === 1,
+    `quick=${JSON.stringify(quickHoverState)} sustained=${JSON.stringify(sustainedHoverState)}`
+  );
+
+  const calloutPreviewState = await waitFor(() =>
+    evalIn(
+      cdp,
+      hub.sessionId,
+      `(() => {
+        const excerpt = document.querySelector('[data-testid="preview-excerpt"]')?.textContent;
+        const shape = document.querySelector('[data-testid="preview-shape"]')?.textContent;
+        const title = document.querySelector('[data-testid="preview-title"]')?.textContent;
+        const activity = document.querySelector('[data-testid="preview-activity"]')?.textContent;
+        return excerpt ? { excerpt, shape, title, activity } : null;
+      })()`,
+      1
+    )
+  );
+  check(
+    "z. first readable callout becomes the excerpt",
+    calloutPreviewState?.excerpt === calloutText &&
+      calloutPreviewState.title === previewEntries[0].title &&
+      calloutPreviewState.activity?.includes(S.preview.visits(7)) &&
+      calloutPreviewState.activity?.includes(S.preview.pinned),
+    JSON.stringify(calloutPreviewState)
+  );
+  const expectedShape = [
+    S.preview.shapeHeadings(2),
+    S.preview.shapeTables(1, 3),
+    S.preview.shapeChips(2, 1, 1),
+    S.preview.shapeFigures(1)
+  ].join(" · ");
+  check("ab. structure summary reports headings, table rows, chips, and figures", calloutPreviewState?.shape === expectedShape, calloutPreviewState?.shape ?? "missing");
+
+  const cachedCallout = await evalIn(
+    cdp,
+    control.sessionId,
+    `chrome.storage.local.get('excerpt:preview-callout').then((got) => got['excerpt:preview-callout'])`,
+    1
+  );
+  await leaveHubRows(cdp, hub.sessionId);
+  const hiddenAfterLeave = await evalIn(cdp, hub.sessionId, "!document.querySelector('[data-testid=\"preview-card\"]')", 1);
+  await hoverEntry(cdp, hub.sessionId, "preview-callout");
+  await sleep(225);
+  const cachedHoverState = await evalIn(
+    cdp,
+    hub.sessionId,
+    "({ fetches: globalThis.__previewFetchState.calls.length, excerpt: document.querySelector('[data-testid=\"preview-excerpt\"]')?.textContent })",
+    1
+  );
+  check(
+    "ac. second hover reads excerpt storage cache without refetching",
+    hiddenAfterLeave && cachedCallout?.excerpt === calloutText && cachedHoverState.fetches === 1 && cachedHoverState.excerpt === calloutText,
+    `hidden=${hiddenAfterLeave} cache=${Boolean(cachedCallout)} state=${JSON.stringify(cachedHoverState)}`
+  );
+
+  await leaveHubRows(cdp, hub.sessionId);
+  await hoverEntry(cdp, hub.sessionId, "preview-paragraph");
+  await sleep(225);
+  const paragraphExcerpt = await waitFor(() =>
+    evalIn(cdp, hub.sessionId, `document.querySelector('[data-testid="preview-excerpt"]')?.textContent === ${JSON.stringify(paragraphText)} ? ${JSON.stringify(paragraphText)} : null`, 1)
+  );
+  check("aa. long paragraph after the first heading becomes the excerpt", paragraphExcerpt === paragraphText, paragraphExcerpt ?? "missing");
+
+  await leaveHubRows(cdp, hub.sessionId);
+  const focusPreviewState = await evalIn(
+    cdp,
+    hub.sessionId,
+    `new Promise((resolve) => {
+      const row = document.querySelector('[data-entry-id="preview-paragraph"]');
+      row?.focus();
+      requestAnimationFrame(() => {
+        const focused = document.activeElement === row;
+        const id = document.querySelector('[data-testid="preview-card"]')?.dataset.previewEntryId;
+        row?.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowUp', bubbles: true }));
+        requestAnimationFrame(() => resolve({ focused, id, arrowId: document.activeElement?.dataset.entryId, arrowPreviewId: document.querySelector('[data-testid="preview-card"]')?.dataset.previewEntryId }));
+      });
+    })`,
+    1
+  );
+  check(
+    "y2. keyboard focus and arrow movement show the same preview card immediately",
+    focusPreviewState?.focused && focusPreviewState.id === "preview-paragraph" && focusPreviewState.arrowId === "preview-callout" && focusPreviewState.arrowPreviewId === "preview-callout",
+    JSON.stringify(focusPreviewState)
+  );
+  await evalIn(cdp, hub.sessionId, "document.querySelector('[data-testid=\"hub-search\"]')?.focus()", 1);
+
+  await leaveHubRows(cdp, hub.sessionId);
+  await hoverEntry(cdp, hub.sessionId, "preview-guarded-web");
+  await sleep(225);
+  const guardedWebState = await evalIn(
+    cdp,
+    hub.sessionId,
+    "({ id: document.querySelector('[data-testid=\"preview-card\"]')?.dataset.previewEntryId, excerpt: Boolean(document.querySelector('[data-testid=\"preview-excerpt\"]')), fetches: globalThis.__previewFetchState.calls.length })",
+    1
+  );
+  check(
+    "ad0. preview fetch boundary rejects a non-file URL even with inconsistent html kind",
+    guardedWebState.id === "preview-guarded-web" && !guardedWebState.excerpt && guardedWebState.fetches === 2,
+    JSON.stringify(guardedWebState)
+  );
+
+  await leaveHubRows(cdp, hub.sessionId);
+  const nonHtmlStates = [];
+  for (const entryId of ["preview-web", "preview-pdf"]) {
+    await hoverEntry(cdp, hub.sessionId, entryId);
+    await sleep(225);
+    nonHtmlStates.push(await evalIn(
+      cdp,
+      hub.sessionId,
+      `(() => {
+        const card = document.querySelector('[data-testid="preview-card"]');
+        return { id: card?.dataset.previewEntryId, source: card?.querySelector('[data-testid="preview-source"]')?.textContent, excerpt: Boolean(card?.querySelector('[data-testid="preview-excerpt"]')), shape: Boolean(card?.querySelector('[data-testid="preview-shape"]')), fetches: globalThis.__previewFetchState.calls.length };
+      })()`,
+      1
+    ));
+    await leaveHubRows(cdp, hub.sessionId);
+  }
+  check(
+    "ad. web and PDF cards contain no excerpt or structure blocks",
+    nonHtmlStates[0]?.id === "preview-web" &&
+      nonHtmlStates[0].source?.includes("example.com") &&
+      nonHtmlStates[1]?.id === "preview-pdf" &&
+      nonHtmlStates[1].source?.includes(S.service.drive) &&
+      nonHtmlStates[1].source?.includes("drive.google.com") &&
+      nonHtmlStates.every((state) => !state.excerpt && !state.shape && state.fetches === 2),
+    JSON.stringify(nonHtmlStates)
+  );
+
+  await hoverEntry(cdp, hub.sessionId, "preview-timeout");
+  await sleep(225);
+  const timeoutStartedState = await evalIn(
+    cdp,
+    hub.sessionId,
+    `(() => {
+      const call = globalThis.__previewFetchState.calls.find((item) => item.url === ${JSON.stringify(previewUrls.timeout)});
+      return { card: Boolean(document.querySelector('[data-testid="preview-card"]')), hasSignal: call?.hasSignal, startedAt: call?.at };
+    })()`,
+    1
+  );
+  await sleep(1550);
+  const observedAbortElapsed = await waitFor(
+    () => evalIn(
+      cdp,
+      hub.sessionId,
+      `(() => {
+        const call = globalThis.__previewFetchState.calls.find((item) => item.url === ${JSON.stringify(previewUrls.timeout)});
+        return call?.abortedAt ? call.abortedAt - call.at : null;
+      })()`,
+      1
+    ),
+    3000
+  );
+  const timeoutState = await evalIn(
+    cdp,
+    hub.sessionId,
+    `(() => {
+      const card = document.querySelector('[data-testid="preview-card"]');
+      return {
+        id: card?.dataset.previewEntryId,
+        excerpt: Boolean(card?.querySelector('[data-testid="preview-excerpt"]')),
+        shape: Boolean(card?.querySelector('[data-testid="preview-shape"]')),
+        elapsed: performance.now() - ${Number(timeoutStartedState?.startedAt ?? 0)},
+        abortElapsed: ${Number(observedAbortElapsed ?? 0)}
+      };
+    })()`,
+    1
+  );
+  check(
+    "ae. 1500ms timeout leaves a responsive metadata-only card",
+    timeoutStartedState?.card &&
+      timeoutStartedState.hasSignal &&
+      timeoutState?.id === "preview-timeout" &&
+      !timeoutState.excerpt &&
+      !timeoutState.shape &&
+      timeoutState.elapsed >= 1500 &&
+      timeoutState.abortElapsed >= 1450 &&
+      timeoutState.abortElapsed <= 1650,
+    `started=${JSON.stringify(timeoutStartedState)} final=${JSON.stringify(timeoutState)}`
   );
 
   await resetHubFixture(cdp, control.sessionId);
@@ -1494,15 +1774,19 @@ try {
           const rect = row.getBoundingClientRect();
           return rect.width > 0 && rect.height > 0 && rect.top >= 0 && rect.left >= 0 && rect.bottom <= innerHeight && rect.right <= innerWidth;
         }).length;
-        return { innerWidth, innerHeight, total: rows.length, within, groups: document.querySelectorAll('[data-testid="band-recent"] .hub-group').length };
+        return { innerWidth, innerHeight, total: rows.length, within, groups: document.querySelectorAll('[data-testid="band-recent"] .hub-group').length, renderMs: performance.now() };
       })()`,
       1
     )
   );
   check(
-    "q. dense layout keeps at least 100 of 140 rows inside a 1680x1000 viewport",
-    densityState?.innerWidth === 1680 && densityState?.innerHeight === 1000 && densityState.within >= 100 && densityState.groups === 20,
-    JSON.stringify(densityState)
+    "q. dense layout and initial render timing stay within the v0.13 baseline",
+    densityState?.innerWidth === 1680 &&
+      densityState?.innerHeight === 1000 &&
+      densityState.within >= 100 &&
+      densityState.groups === 20 &&
+      densityState.renderMs < V013_DENSE_RENDER_BASELINE_MS * 1.1,
+    `${JSON.stringify(densityState)} baselineMs=${V013_DENSE_RENDER_BASELINE_MS} limitMs=${(V013_DENSE_RENDER_BASELINE_MS * 1.1).toFixed(1)}`
   );
 
   if (openedBookmarkTabs?.length) {

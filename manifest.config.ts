@@ -23,6 +23,9 @@ export default defineManifest({
   side_panel: {
     default_path: "src/sidepanel/sidepanel.html"
   },
+  chrome_url_overrides: {
+    newtab: "src/newtab/index.html"
+  },
   content_scripts: [
     {
       // 2026-07-14 perf: was <all_urls> — no reason to load the editor script
@@ -44,7 +47,9 @@ export default defineManifest({
     "tabGroups",
     "history",
     "webNavigation",
-    "alarms"
+    "alarms",
+    "search",
+    "favicon"
   ],
   host_permissions: ["<all_urls>"],
   web_accessible_resources: [

@@ -2,9 +2,9 @@ export interface ReportEntry {
   id: string;
   /** Last observed raw URL. Preferred when reopening (avoids encode round-trip drift). */
   url: string;
-  /** Decoded display path, forward slashes, NFC-normalized. e.g. "G:/マイドライブ/案件X/レビュー.html" */
+  /** Display path: decoded file path, or host + path for web/pdf targets. */
   path: string;
-  /** Dedup key: path lowercased (Windows FS is case-insensitive). */
+  /** Kind-specific normalized, lowercased dedup key. */
   key: string;
   title: string;
   /** Derived group name; recomputable from Settings.groupRules. */
@@ -18,7 +18,28 @@ export interface ReportEntry {
   missing: boolean | null;
   missingCheckedAt: number | null;
   source: "live" | "backfill" | "import";
+  kind: "web" | "html" | "pdf";
+  later: boolean;
+  laterAt: number | null;
 }
+
+/** Compact projection stored under index:newtab. */
+export type NewTabIndexEntry = Pick<
+  ReportEntry,
+  | "id"
+  | "url"
+  | "path"
+  | "key"
+  | "title"
+  | "group"
+  | "lastSeenAt"
+  | "visitCount"
+  | "pinned"
+  | "archived"
+  | "kind"
+  | "later"
+  | "laterAt"
+>;
 
 export interface GroupRule {
   /** Regex (case-insensitive) applied to ReportEntry.path. */
@@ -46,7 +67,7 @@ export interface UndoSnapshot {
 }
 
 export interface Meta {
-  schemaVersion: 1;
+  schemaVersion: 2;
   backfillDoneAt: number | null;
 }
 

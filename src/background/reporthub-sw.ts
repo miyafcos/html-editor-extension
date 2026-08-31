@@ -7,6 +7,7 @@
 import type { Msg, MsgResponse } from "../reporthub/messages";
 import {
   enforceEntryCap,
+  ensureSchemaV2,
   getMeta,
   getSettings,
   patchEntryByKey,
@@ -27,7 +28,7 @@ import {
   toggleCollapse,
   undoLastClose
 } from "../reporthub/tabops";
-import { isTargetFile, normalizeFileUrl } from "../reporthub/url";
+import { isTargetFile, normalizeFileUrl, normalizeTarget } from "../reporthub/url";
 
 const RH_TYPES = new Set<Msg["type"]>([
   "organize-tabs",
@@ -51,6 +52,10 @@ const failKey = (tabId: number) => `navfail:${tabId}`;
 const AUTO_DISCARD_ALARM = "reporthub:auto-discard";
 const AUTO_DISCARD_PERIOD_MINUTES = 5;
 const replacementMigrations = new Map<number, Promise<void>>();
+const updateTimers = new Map<number, ReturnType<typeof setTimeout>>();
+const lastSignatures = new Map<number, { signature: string; at: number }>();
+const UPDATE_DEBOUNCE_MS = 400;
+let schemaReady: Promise<void> = Promise.resolve();
 
 async function ensureAutoDiscardAlarm(): Promise<void> {
   const existing = await chrome.alarms.get(AUTO_DISCARD_ALARM);
@@ -83,6 +88,7 @@ async function migrateTabSessionKeys(addedTabId: number, removedTabId: number): 
 }
 
 export function initReportHub(): void {
+  schemaReady = ensureSchemaV2();
   void chrome.action.setBadgeBackgroundColor({ color: "#2563eb" });
   void updateBadge();
   void ensureAutoDiscardAlarm();
@@ -91,6 +97,7 @@ export function initReportHub(): void {
   // where Report Hub arrives via an *update* to the existing HTML Editor install.
   chrome.runtime.onInstalled.addListener(() => {
     void (async () => {
+      await schemaReady;
       await ensureAutoDiscardAlarm();
       const meta = await getMeta();
       if (meta.backfillDoneAt == null) {
@@ -102,17 +109,25 @@ export function initReportHub(): void {
 
   chrome.commands.onCommand.addListener((command) => {
     void (async () => {
+      await schemaReady;
       const settings = await getSettings();
       if (command === "organize-collapse") await organizeTabs(settings, true);
       else if (command === "toggle-collapse") await toggleCollapse(settings);
     })();
   });
 
-  chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-    void handleTabUpdated(tabId, changeInfo, tab);
+  chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+    if (changeInfo.status === "complete") scheduleTabUpdated(tabId);
+    if (changeInfo.status === "complete" || changeInfo.url || changeInfo.pinned != null) {
+      scheduleBadgeUpdate();
+    }
   });
 
   chrome.tabs.onRemoved.addListener((tabId) => {
+    const timer = updateTimers.get(tabId);
+    if (timer) clearTimeout(timer);
+    updateTimers.delete(tabId);
+    lastSignatures.delete(tabId);
     void chrome.storage.session.remove([
       visitKey(tabId),
       reloadKey(tabId),
@@ -123,6 +138,10 @@ export function initReportHub(): void {
   });
 
   chrome.tabs.onReplaced.addListener((addedTabId, removedTabId) => {
+    const timer = updateTimers.get(removedTabId);
+    if (timer) clearTimeout(timer);
+    updateTimers.delete(removedTabId);
+    lastSignatures.delete(removedTabId);
     const migration = migrateTabSessionKeys(addedTabId, removedTabId).finally(() => {
       if (replacementMigrations.get(addedTabId) === migration) {
         replacementMigrations.delete(addedTabId);
@@ -143,7 +162,7 @@ export function initReportHub(): void {
 
   chrome.webNavigation.onCommitted.addListener((details) => {
     if (details.frameId !== 0) return;
-    if (!details.url.startsWith("file:")) return;
+    if (!/^(?:file|https?):/.test(details.url)) return;
     if (details.transitionType === "reload") {
       void chrome.storage.session.set({ [reloadKey(details.tabId)]: true });
     }
@@ -164,6 +183,7 @@ export function initReportHub(): void {
       if (!msg || typeof msg !== "object" || !RH_TYPES.has(msg.type)) return;
       void (async () => {
         try {
+          await schemaReady;
           const settings = await getSettings();
           switch (msg.type) {
             case "organize-tabs":
@@ -232,51 +252,80 @@ async function updateBadge(): Promise<void> {
   }
 }
 
-async function handleTabUpdated(
-  tabId: number,
-  changeInfo: chrome.tabs.TabChangeInfo,
-  tab: chrome.tabs.Tab
-): Promise<void> {
-  if (changeInfo.status === "complete" || changeInfo.url) void updateBadge();
-  const norm = normalizeFileUrl(tab.url);
-  if (!norm) return;
-  const settings = await getSettings();
-  if (!isTargetFile(norm, settings)) return;
+let badgeTimer: ReturnType<typeof setTimeout> | undefined;
 
-  if (changeInfo.status === "complete") {
-    await replacementMigrations.get(tabId);
-    const sess = await chrome.storage.session.get([
-      visitKey(tabId),
-      reloadKey(tabId),
-      failKey(tabId),
-      discardKey(tabId)
-    ]);
-    if (sess[failKey(tabId)] === norm.key) {
-      await chrome.storage.session.remove([failKey(tabId), reloadKey(tabId)]);
-      return;
-    }
-    const lastKey = sess[visitKey(tabId)] as string | undefined;
-    const reloaded = Boolean(sess[reloadKey(tabId)]);
-    const resumedFromDiscard = sess[discardKey(tabId)] === norm.key;
-    const countVisit = !resumedFromDiscard && (lastKey !== norm.key || reloaded);
-    await chrome.storage.session.set({ [visitKey(tabId)]: norm.key });
-    await chrome.storage.session.remove([reloadKey(tabId), discardKey(tabId)]);
-    await upsertVisit(
-      {
-        url: norm.url,
-        path: norm.path,
-        key: norm.key,
-        title: tab.title,
-        at: Date.now(),
-        source: "live",
-        countVisit
-      },
-      settings
-    );
-    await enforceEntryCap();
-  } else if (changeInfo.title) {
-    await patchEntryByKey(norm.key, { title: changeInfo.title });
+function scheduleBadgeUpdate(): void {
+  if (badgeTimer) clearTimeout(badgeTimer);
+  badgeTimer = setTimeout(() => {
+    badgeTimer = undefined;
+    void updateBadge();
+  }, UPDATE_DEBOUNCE_MS);
+}
+
+function scheduleTabUpdated(tabId: number): void {
+  const pending = updateTimers.get(tabId);
+  if (pending) clearTimeout(pending);
+  updateTimers.set(
+    tabId,
+    setTimeout(() => {
+      updateTimers.delete(tabId);
+      void (async () => {
+        try {
+          await schemaReady;
+          const tab = await chrome.tabs.get(tabId);
+          const signature = `${tabId}:${tab.url ?? ""}`;
+          const previous = lastSignatures.get(tabId);
+          if (
+            previous?.signature === signature &&
+            Date.now() - previous.at < UPDATE_DEBOUNCE_MS
+          ) {
+            return;
+          }
+          lastSignatures.set(tabId, { signature, at: Date.now() });
+          await handleTabCompleted(tabId, tab);
+        } catch {
+          // The tab may have closed during the debounce window.
+        }
+      })();
+    }, UPDATE_DEBOUNCE_MS)
+  );
+}
+
+async function handleTabCompleted(tabId: number, tab: chrome.tabs.Tab): Promise<void> {
+  const settings = await getSettings();
+  const norm = normalizeTarget(tab.url, settings);
+  if (!norm) return;
+  await replacementMigrations.get(tabId);
+  const sess = await chrome.storage.session.get([
+    visitKey(tabId),
+    reloadKey(tabId),
+    failKey(tabId),
+    discardKey(tabId)
+  ]);
+  if (sess[failKey(tabId)] === norm.key) {
+    await chrome.storage.session.remove([failKey(tabId), reloadKey(tabId)]);
+    return;
   }
+  const lastKey = sess[visitKey(tabId)] as string | undefined;
+  const reloaded = Boolean(sess[reloadKey(tabId)]);
+  const resumedFromDiscard = sess[discardKey(tabId)] === norm.key;
+  const countVisit = !resumedFromDiscard && (lastKey !== norm.key || reloaded);
+  await chrome.storage.session.set({ [visitKey(tabId)]: norm.key });
+  await chrome.storage.session.remove([reloadKey(tabId), discardKey(tabId)]);
+  await upsertVisit(
+    {
+      url: norm.url,
+      path: norm.path,
+      key: norm.key,
+      kind: norm.kind,
+      title: tab.title,
+      at: Date.now(),
+      source: "live",
+      countVisit
+    },
+    settings
+  );
+  await enforceEntryCap();
 }
 
 async function backfillFromHistory(): Promise<number> {
@@ -304,6 +353,7 @@ async function backfillFromHistory(): Promise<number> {
         url: norm.url,
         path: norm.path,
         key: norm.key,
+        kind: "html",
         title: item.title,
         at: lastVisit,
         source: "backfill",

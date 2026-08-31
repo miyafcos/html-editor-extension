@@ -7,6 +7,13 @@ export interface NormalizedFile {
   key: string;
 }
 
+export interface NormalizedTarget {
+  url: string;
+  path: string;
+  key: string;
+  kind: "web" | "html" | "pdf";
+}
+
 /**
  * file:// URL → decoded path + dedup key.
  * Returns null for non-file URLs.
@@ -52,6 +59,53 @@ export function isExcluded(key: string, settings: Settings): boolean {
 
 export function isTargetFile(norm: NormalizedFile, settings: Settings): boolean {
   return isHtmlPath(norm.path) && !isExcluded(norm.key, settings);
+}
+
+const TRACKING_PARAMS = new Set(["gclid", "fbclid", "mc_eid", "_ga"]);
+
+function isTrackingParam(name: string): boolean {
+  const lower = name.toLowerCase();
+  return lower.startsWith("utm_") || TRACKING_PARAMS.has(lower);
+}
+
+/** Normalize every URL kind tracked by the new-tab hub. */
+export function normalizeTarget(
+  rawUrl: string | null | undefined,
+  settings: Settings
+): NormalizedTarget | null {
+  if (!rawUrl) return null;
+  if (rawUrl.startsWith("file:")) {
+    const norm = normalizeFileUrl(rawUrl);
+    if (!norm || isExcluded(norm.key, settings)) return null;
+    const kind = isHtmlPath(norm.path) ? "html" : /\.pdf$/i.test(norm.path) ? "pdf" : null;
+    return kind ? { ...norm, kind } : null;
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+
+  for (const name of [...parsed.searchParams.keys()]) {
+    if (isTrackingParam(name)) parsed.searchParams.delete(name);
+  }
+  let pathname = parsed.pathname;
+  if (pathname.length > 1) pathname = pathname.replace(/\/+$/, "");
+  const query = parsed.searchParams.toString();
+  const key = `${parsed.host}${pathname}${query ? `?${query}` : ""}`
+    .toLowerCase()
+    .normalize("NFC");
+  if (isExcluded(key, settings)) return null;
+
+  return {
+    url: rawUrl,
+    path: `${parsed.host}${parsed.pathname}`.normalize("NFC"),
+    key,
+    kind: /\.pdf$/i.test(parsed.pathname) ? "pdf" : "web"
+  };
 }
 
 export function inferGroup(path: string, rules: GroupRule[]): string {

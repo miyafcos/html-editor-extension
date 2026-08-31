@@ -1,12 +1,26 @@
-import type { ExportFile, Meta, ReportEntry, Settings, TabSet } from "./types";
+import type {
+  ExportFile,
+  Meta,
+  NewTabIndexEntry,
+  ReportEntry,
+  Settings,
+  TabSet
+} from "./types";
 import { DEFAULT_SETTINGS } from "./types";
-import { entryIdFromKey, fileName, inferGroup } from "./url";
+import { entryIdFromKey, fileName, inferGroup, normalizeTarget } from "./url";
 
 const ENTRY_PREFIX = "entry:";
 const SETTINGS_KEY = "settings";
 const META_KEY = "meta";
 /** Above this, oldest archived non-pinned entries are pruned. */
 const ENTRY_CAP = 10000;
+
+interface LegacyMeta {
+  schemaVersion: 1;
+  backfillDoneAt: number | null;
+}
+
+type StoredMeta = Meta | LegacyMeta;
 
 export function entryStorageKey(id: string): string {
   return ENTRY_PREFIX + id;
@@ -26,14 +40,65 @@ export async function saveSettings(s: Settings): Promise<void> {
   await chrome.storage.local.set({ [SETTINGS_KEY]: s });
 }
 
-export async function getMeta(): Promise<Meta> {
+export async function getMeta(): Promise<StoredMeta> {
   const got = await chrome.storage.local.get(META_KEY);
-  return (got[META_KEY] as Meta | undefined) ?? { schemaVersion: 1, backfillDoneAt: null };
+  return (got[META_KEY] as StoredMeta | undefined) ?? {
+    schemaVersion: 1,
+    backfillDoneAt: null
+  };
 }
 
 export async function patchMeta(patch: Partial<Meta>): Promise<void> {
   const meta = await getMeta();
-  await chrome.storage.local.set({ [META_KEY]: { ...meta, ...patch } });
+  await chrome.storage.local.set({
+    [META_KEY]: { ...meta, schemaVersion: 2, ...patch }
+  });
+}
+
+let migrationPromise: Promise<void> | null = null;
+
+/** Upgrade legacy file-only entries in one idempotent storage write. */
+export function ensureSchemaV2(): Promise<void> {
+  if (!migrationPromise) {
+    migrationPromise = migrateSchemaV2().catch((error) => {
+      migrationPromise = null;
+      throw error;
+    });
+  }
+  return migrationPromise;
+}
+
+async function migrateSchemaV2(): Promise<void> {
+  const metaGot = await chrome.storage.local.get(META_KEY);
+  const meta = (metaGot[META_KEY] as StoredMeta | undefined) ?? {
+    schemaVersion: 1,
+    backfillDoneAt: null
+  };
+  if (meta.schemaVersion === 2) return;
+
+  const all = await chrome.storage.local.get(null);
+  const migrated: ReportEntry[] = [];
+  const record: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(all)) {
+    if (!isEntryStorageKey(key)) continue;
+    const raw = value as Partial<ReportEntry>;
+    const later = raw.later === true;
+    const entry = {
+      ...raw,
+      kind:
+        raw.kind === "web" || raw.kind === "pdf" || raw.kind === "html"
+          ? raw.kind
+          : "html",
+      later,
+      laterAt: later && typeof raw.laterAt === "number" ? raw.laterAt : null
+    } as ReportEntry;
+    migrated.push(entry);
+    record[key] = entry;
+  }
+  record[PANEL_INDEX_KEY] = trimPanelIndex(migrated);
+  record[NEW_TAB_INDEX_KEY] = trimNewTabIndex(migrated);
+  record[META_KEY] = { schemaVersion: 2, backfillDoneAt: meta.backfillDoneAt } satisfies Meta;
+  await chrome.storage.local.set(record);
 }
 
 export async function getAllEntries(): Promise<ReportEntry[]> {
@@ -49,17 +114,42 @@ export async function getEntry(id: string): Promise<ReportEntry | null> {
   return (got[k] as ReportEntry | undefined) ?? null;
 }
 
-export async function putEntry(e: ReportEntry): Promise<void> {
-  await chrome.storage.local.set({ [entryStorageKey(e.id)]: e });
-  await updatePanelIndex(e);
+let ledgerWriteChain: Promise<unknown> = Promise.resolve();
+
+function serializeLedgerWrite(task: () => Promise<void>): Promise<void> {
+  const next = ledgerWriteChain.then(task, task);
+  ledgerWriteChain = next.catch(() => undefined);
+  return next;
 }
 
-export async function putEntries(list: ReportEntry[]): Promise<void> {
-  if (!list.length) return;
-  const record: Record<string, ReportEntry> = {};
-  for (const e of list) record[entryStorageKey(e.id)] = e;
-  await chrome.storage.local.set(record);
-  await rebuildPanelIndex();
+export function putEntry(e: ReportEntry): Promise<void> {
+  return serializeLedgerWrite(async () => {
+    const [panel, newTab] = await Promise.all([getPanelIndex(), getNewTabIndex()]);
+    let all: ReportEntry[] | null = null;
+    if (panel === null || newTab === null) all = await getAllEntries();
+    const panelBase = panel ?? all ?? [];
+    const newTabBase = newTab ?? (all ?? []).map(toNewTabIndexEntry);
+    await chrome.storage.local.set({
+      [entryStorageKey(e.id)]: e,
+      [PANEL_INDEX_KEY]: trimPanelIndex([...panelBase, e]),
+      [NEW_TAB_INDEX_KEY]: trimNewTabIndex([...newTabBase, toNewTabIndexEntry(e)])
+    });
+  });
+}
+
+export function putEntries(list: ReportEntry[]): Promise<void> {
+  if (!list.length) return Promise.resolve();
+  return serializeLedgerWrite(async () => {
+    const byId = new Map((await getAllEntries()).map((entry) => [entry.id, entry]));
+    for (const entry of list) byId.set(entry.id, entry);
+    const merged = [...byId.values()];
+    const record: Record<string, unknown> = {
+      [PANEL_INDEX_KEY]: trimPanelIndex(merged),
+      [NEW_TAB_INDEX_KEY]: trimNewTabIndex(merged.map(toNewTabIndexEntry))
+    };
+    for (const entry of list) record[entryStorageKey(entry.id)] = entry;
+    await chrome.storage.local.set(record);
+  });
 }
 
 export async function patchEntry(
@@ -80,16 +170,17 @@ export async function patchEntryByKey(
   return patchEntry(await entryIdFromKey(key), patch);
 }
 
-export async function removeEntries(ids: string[]): Promise<void> {
-  if (!ids.length) return;
-  await chrome.storage.local.remove(ids.map(entryStorageKey));
-  const idx = await getPanelIndex();
-  if (idx) {
+export function removeEntries(ids: string[]): Promise<void> {
+  if (!ids.length) return Promise.resolve();
+  return serializeLedgerWrite(async () => {
+    const [panel, newTab] = await Promise.all([getPanelIndex(), getNewTabIndex()]);
     const gone = new Set(ids);
-    await chrome.storage.local.set({
-      [PANEL_INDEX_KEY]: idx.filter((e) => !gone.has(e.id))
-    });
-  }
+    await chrome.storage.local.remove(ids.map(entryStorageKey));
+    const record: Record<string, unknown> = {};
+    if (panel) record[PANEL_INDEX_KEY] = panel.filter((entry) => !gone.has(entry.id));
+    if (newTab) record[NEW_TAB_INDEX_KEY] = newTab.filter((entry) => !gone.has(entry.id));
+    if (Object.keys(record).length) await chrome.storage.local.set(record);
+  });
 }
 
 // -------------------- panel index (2026-07-14 perf) --------------------
@@ -146,10 +237,70 @@ export async function rebuildPanelIndex(): Promise<ReportEntry[]> {
   return list;
 }
 
+// -------------------- new-tab index --------------------
+
+export const NEW_TAB_INDEX_KEY = "index:newtab";
+
+function toNewTabIndexEntry(entry: ReportEntry): NewTabIndexEntry {
+  const {
+    id,
+    url,
+    path,
+    key,
+    title,
+    group,
+    lastSeenAt,
+    visitCount,
+    pinned,
+    archived,
+    kind,
+    later,
+    laterAt
+  } = entry;
+  return {
+    id,
+    url,
+    path,
+    key,
+    title,
+    group,
+    lastSeenAt,
+    visitCount,
+    pinned,
+    archived,
+    kind,
+    later,
+    laterAt
+  };
+}
+
+function trimNewTabIndex(list: NewTabIndexEntry[]): NewTabIndexEntry[] {
+  const byId = new Map<string, NewTabIndexEntry>();
+  for (const entry of list) byId.set(entry.id, entry);
+  return [...byId.values()]
+    .filter(
+      (entry) => !entry.archived && (entry.visitCount >= 2 || entry.pinned || entry.later)
+    )
+    .sort((a, b) => b.lastSeenAt - a.lastSeenAt);
+}
+
+export async function getNewTabIndex(): Promise<NewTabIndexEntry[] | null> {
+  const got = await chrome.storage.local.get(NEW_TAB_INDEX_KEY);
+  const list = got[NEW_TAB_INDEX_KEY] as NewTabIndexEntry[] | undefined;
+  return Array.isArray(list) ? list : null;
+}
+
+export async function rebuildNewTabIndex(): Promise<NewTabIndexEntry[]> {
+  const list = trimNewTabIndex((await getAllEntries()).map(toNewTabIndexEntry));
+  await chrome.storage.local.set({ [NEW_TAB_INDEX_KEY]: list });
+  return list;
+}
+
 export interface VisitInput {
   url: string;
   path: string;
   key: string;
+  kind?: ReportEntry["kind"];
   title?: string;
   at: number;
   source: ReportEntry["source"];
@@ -162,12 +313,16 @@ export interface VisitInput {
 }
 
 export async function upsertVisit(v: VisitInput, settings: Settings): Promise<ReportEntry> {
+  const kind = v.kind ?? normalizeTarget(v.url, settings)?.kind ?? "html";
   const id = await entryIdFromKey(v.key);
   const cur = await getEntry(id);
   if (cur) {
     const next: ReportEntry = {
       ...cur,
       url: v.url || cur.url,
+      path: v.path,
+      key: v.key,
+      kind,
       title: v.title && v.title.trim() ? v.title : cur.title,
       firstSeenAt: Math.min(cur.firstSeenAt, v.firstSeenAt ?? v.at),
       lastSeenAt: Math.max(cur.lastSeenAt, v.at),
@@ -197,7 +352,10 @@ export async function upsertVisit(v: VisitInput, settings: Settings): Promise<Re
     archived: false,
     missing: v.source === "live" ? false : null,
     missingCheckedAt: v.source === "live" ? v.at : null,
-    source: v.source
+    source: v.source,
+    kind,
+    later: false,
+    laterAt: null
   };
   await putEntry(entry);
   return entry;
@@ -275,8 +433,19 @@ export async function importData(
     if (!raw?.key || !raw?.path) continue;
     const id = await entryIdFromKey(raw.key);
     const cur = await getEntry(id);
+    const imported: ReportEntry = {
+      ...raw,
+      id,
+      kind:
+        raw.kind === "web" || raw.kind === "pdf" || raw.kind === "html"
+          ? raw.kind
+          : "html",
+      later: raw.later === true,
+      laterAt: raw.later === true && typeof raw.laterAt === "number" ? raw.laterAt : null,
+      group: inferGroup(raw.path, settings.groupRules)
+    };
     if (!cur) {
-      await putEntry({ ...raw, id, group: inferGroup(raw.path, settings.groupRules) });
+      await putEntry(imported);
     } else {
       await putEntry({
         ...cur,
@@ -284,7 +453,9 @@ export async function importData(
         firstSeenAt: Math.min(cur.firstSeenAt, raw.firstSeenAt),
         lastSeenAt: Math.max(cur.lastSeenAt, raw.lastSeenAt),
         visitCount: Math.max(cur.visitCount, raw.visitCount),
-        pinned: cur.pinned || raw.pinned
+        pinned: cur.pinned || raw.pinned,
+        later: cur.later || imported.later,
+        laterAt: cur.later ? cur.laterAt : imported.laterAt
       });
     }
     merged++;

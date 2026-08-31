@@ -4,18 +4,17 @@ import {
   NEW_TAB_INDEX_KEY,
   SERVICE_RULES_KEY,
   ensureSchemaV3,
-  getAllEntries,
   getEntry,
   getNewTabIndex,
-  getSettings,
+  getServiceRules,
   patchEntry,
   putEntry,
   promoteServiceRules,
-  rebuildNewTabIndex,
   removeEntries
 } from "../reporthub/repo";
 import { UNDO_KEY } from "../reporthub/tabops";
 import {
+  DEFAULT_SETTINGS,
   FALLBACK_GROUP,
   type NewTabIndexEntry,
   type ReportEntry,
@@ -34,13 +33,14 @@ import {
   parentDir,
   serviceHostname
 } from "../reporthub/url";
-import { getHtmlPreview, type HtmlPreviewData } from "./preview";
+import type { HtmlPreviewData } from "./preview";
+import type { HubIndexMatch, HubIndexSnapshot } from "./hubindex";
 import { S } from "./strings";
 
 type Kind = ReportEntry["kind"];
 type KindFilter = "all" | Kind;
 type Band = "open" | "recent" | "later";
-type CollapsibleBand = Band | "bookmarks";
+type CollapsibleBand = Band | "bookmarks" | "hubIndex";
 
 interface HubEntry extends NewTabIndexEntry {
   tabId?: number;
@@ -63,25 +63,63 @@ interface PreviewState {
   html?: HtmlPreviewData;
 }
 
+type HubIndexModule = typeof import("./hubindex");
+
+interface HubIndexState {
+  api: HubIndexModule | null;
+  snapshot: HubIndexSnapshot | null;
+}
+
 const KINDS: Kind[] = ["web", "html", "pdf"];
 const KIND_FILTERS: KindFilter[] = ["all", ...KINDS];
 const BANDS: Band[] = ["open", "recent", "later"];
-const COLLAPSIBLE_BANDS: CollapsibleBand[] = ["open", "recent", "bookmarks", "later"];
+const COLLAPSIBLE_BANDS: CollapsibleBand[] = ["open", "recent", "bookmarks", "hubIndex", "later"];
 const SILENT_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
 const LAYOUT_STORAGE_KEY = "tabhub:layout";
 const PREVIEW_WIDTH = 340;
 const PREVIEW_GAP = 10;
 const PREVIEW_EDGE = 8;
 const PREVIEW_HOVER_DELAY_MS = 200;
+const LEDGER_MAINTENANCE_DELAY_MS = 1000;
+const SETTINGS_STORAGE_KEY = "settings";
+const META_STORAGE_KEY = "meta";
 
 interface LayoutState {
   kind: KindFilter;
   collapsedBands: CollapsibleBand[];
   selectedServices: string[];
+  selectedCategories: string[];
+}
+
+interface NewTabBootstrap {
+  settings: Settings;
+  schemaVersion: number;
+  serviceRules: ServiceRulesStore | null;
+  index: NewTabIndexEntry[] | null;
+}
+
+async function getNewTabBootstrap(): Promise<NewTabBootstrap> {
+  const got = await chrome.storage.local.get([
+    SETTINGS_STORAGE_KEY,
+    META_STORAGE_KEY,
+    SERVICE_RULES_KEY,
+    NEW_TAB_INDEX_KEY
+  ]);
+  const storedSettings = got[SETTINGS_STORAGE_KEY] as Partial<Settings> | undefined;
+  const storedMeta = got[META_STORAGE_KEY] as { schemaVersion?: unknown } | undefined;
+  const storedIndex = got[NEW_TAB_INDEX_KEY] as NewTabIndexEntry[] | undefined;
+  return {
+    settings: { ...DEFAULT_SETTINGS, ...storedSettings },
+    schemaVersion: typeof storedMeta?.schemaVersion === "number" ? storedMeta.schemaVersion : 1,
+    serviceRules: Object.prototype.hasOwnProperty.call(got, SERVICE_RULES_KEY)
+      ? got[SERVICE_RULES_KEY] as ServiceRulesStore
+      : null,
+    index: Array.isArray(storedIndex) ? storedIndex : null
+  };
 }
 
 function readLayoutState(): LayoutState {
-  const fallback: LayoutState = { kind: "all", collapsedBands: [], selectedServices: [] };
+  const fallback: LayoutState = { kind: "all", collapsedBands: [], selectedServices: [], selectedCategories: [] };
   try {
     const stored = JSON.parse(localStorage.getItem(LAYOUT_STORAGE_KEY) ?? "null") as Partial<LayoutState> | null;
     if (!stored || !KIND_FILTERS.includes(stored.kind as KindFilter)) return fallback;
@@ -93,10 +131,30 @@ function readLayoutState(): LayoutState {
     const selectedServices = Array.isArray(stored.selectedServices)
       ? [...new Set(stored.selectedServices.filter((id): id is string => typeof id === "string"))]
       : [];
-    return { kind: stored.kind as KindFilter, collapsedBands: [...new Set(collapsedBands)], selectedServices };
+    const selectedCategories = Array.isArray(stored.selectedCategories)
+      ? [...new Set(stored.selectedCategories
+          .filter((category): category is string => typeof category === "string")
+          .map((category) => category.trim().normalize("NFC"))
+          .filter(Boolean))]
+      : [];
+    return { kind: stored.kind as KindFilter, collapsedBands: [...new Set(collapsedBands)], selectedServices, selectedCategories };
   } catch {
     return fallback;
   }
+}
+
+async function getLedgerEntriesOnly(): Promise<ReportEntry[]> {
+  const keys = (await chrome.storage.local.getKeys()).filter((key) => key.startsWith("entry:"));
+  if (!keys.length) return [];
+  const stored = await chrome.storage.local.get(keys);
+  return keys.map((key) => stored[key]).filter((value): value is ReportEntry => Boolean(value && typeof value === "object"));
+}
+
+function buildNewTabIndex(entries: ReportEntry[]): NewTabIndexEntry[] {
+  return entries
+    .filter((entry) => !entry.archived && (entry.visitCount >= 2 || entry.pinned || entry.later))
+    .map(compact)
+    .sort((left, right) => right.lastSeenAt - left.lastSeenAt);
 }
 
 function compact(entry: ReportEntry): NewTabIndexEntry {
@@ -148,13 +206,19 @@ function ruleColorStyle(rule: ServiceRule | null): React.CSSProperties {
   return { backgroundColor: `var(${rule?.color ?? "--svc-other"})` };
 }
 
-function Favicon({ url, rule }: { url: string; rule: ServiceRule | null }) {
-  const [failed, setFailed] = useState(false);
-  useEffect(() => setFailed(false), [url]);
-  if (url.startsWith("file:") || failed) {
+function RemoteFavicon({ url, rule }: { url: string; rule: ServiceRule | null }) {
+  const [failedUrl, setFailedUrl] = useState<string | null>(null);
+  if (failedUrl === url) {
     return <span className="favicon favicon-fallback" style={ruleColorStyle(rule)} aria-hidden="true" />;
   }
-  return <img className="favicon" src={faviconUrl(url)} alt="" onError={() => setFailed(true)} />;
+  return <img className="favicon" src={faviconUrl(url)} alt="" onError={() => setFailedUrl(url)} />;
+}
+
+function Favicon({ url, rule }: { url: string; rule: ServiceRule | null }) {
+  if (url.startsWith("file:")) {
+    return <span className="favicon favicon-fallback" style={ruleColorStyle(rule)} aria-hidden="true" />;
+  }
+  return <RemoteFavicon url={url} rule={rule} />;
 }
 
 function bookmarkBarChildren(tree: chrome.bookmarks.BookmarkTreeNode[]): chrome.bookmarks.BookmarkTreeNode[] {
@@ -352,10 +416,47 @@ function BookmarkResult({
   );
 }
 
+interface HubIndexDisplayMatch extends HubIndexMatch {
+  url: string;
+}
+
+function HubIndexResult({
+  match,
+  onOpen
+}: {
+  match: HubIndexDisplayMatch;
+  onOpen: (url: string) => void;
+}) {
+  const { row, url } = match;
+  const tags = row.g.slice(0, 3);
+  const remainingTags = row.g.length - tags.length;
+  const metadata = [row.c, ...tags, remainingTags > 0 ? S.hubIndex.moreTags(remainingTags) : ""]
+    .filter(Boolean)
+    .join(" · ");
+  return (
+    <button
+      type="button"
+      className="bookmark-result hub-index-result"
+      data-testid={`hub-index-${row.i}`}
+      data-hub-index-id={row.i}
+      data-category={row.c}
+      title={`${row.t}\n${row.d}\n${url}`}
+      onClick={() => onOpen(url)}
+    >
+      <span className="hub-index-mark" aria-hidden="true" />
+      <span className="hub-index-copy">
+        <span className="hub-index-title">{row.t}</span>
+        <span className="hub-index-meta">{metadata}</span>
+      </span>
+    </button>
+  );
+}
+
 function AppRow({
   entry,
   band,
   serviceRule,
+  controlsReady,
   onOpen,
   onLater,
   onClose
@@ -363,6 +464,7 @@ function AppRow({
   entry: HubEntry;
   band: Band;
   serviceRule: ServiceRule | null;
+  controlsReady: boolean;
   onOpen: (entry: HubEntry, band: Band) => void;
   onLater: (entry: HubEntry) => void;
   onClose: (entry: HubEntry, band: Band) => void;
@@ -398,7 +500,7 @@ function AppRow({
     >
       <Favicon url={entry.url} rule={serviceRule} />
       <span className="row-copy">{entry.title || fileName(entry.path)}</span>
-      <span className="row-actions">
+      {controlsReady && <span className="row-actions">
         {band === "open" && (
           <button
             type="button"
@@ -425,7 +527,7 @@ function AppRow({
         >
           ×
         </button>
-      </span>
+      </span>}
     </article>
   );
 }
@@ -435,6 +537,39 @@ interface HubGroup {
   name: string;
   kind: Kind;
   entries: HubEntry[];
+}
+
+function ledgerColumnCount(width = window.innerWidth): number {
+  if (width <= 1050) return 2;
+  if (width <= 1400) return 3;
+  return 4;
+}
+
+function splitGroupColumns(groups: HubGroup[], columnCount: number, isCollapsed: (group: HubGroup) => boolean): HubGroup[][] {
+  if (!groups.length) return [];
+  const count = Math.min(columnCount, groups.length);
+  const weights = groups.map((group) => 36 + (isCollapsed(group) ? 0 : group.entries.length * 24));
+  const columns: HubGroup[][] = [];
+  let index = 0;
+  let remainingWeight = weights.reduce((sum, weight) => sum + weight, 0);
+  for (let column = 0; column < count; column += 1) {
+    if (column === count - 1) {
+      columns.push(groups.slice(index));
+      break;
+    }
+    const target = remainingWeight / (count - column);
+    const start = index;
+    let weight = 0;
+    while (index < groups.length - (count - column - 1)) {
+      const nextWeight = weights[index];
+      if (index > start && Math.abs(target - weight) <= Math.abs(target - weight - nextWeight)) break;
+      weight += nextWeight;
+      index += 1;
+    }
+    columns.push(groups.slice(start, index));
+    remainingWeight -= weight;
+  }
+  return columns;
 }
 
 export function App() {
@@ -450,7 +585,12 @@ export function App() {
   const [collapsedGroups, setCollapsedGroups] = useState<string[]>([]);
   const [tabstripBusy, setTabstripBusy] = useState(false);
   const [preview, setPreview] = useState<PreviewState | null>(null);
+  const [hubIndexState, setHubIndexState] = useState<HubIndexState | null>(null);
+  const [ledgerPaths, setLedgerPaths] = useState<string[]>([]);
+  const [columnCount, setColumnCount] = useState(ledgerColumnCount);
+  const [controlsReady, setControlsReady] = useState(false);
   const fullLoadRef = useRef<Promise<NewTabIndexEntry[]> | null>(null);
+  const hubIndexLoadRef = useRef<Promise<HubIndexState> | null>(null);
   const previewCardRef = useRef<HTMLElement>(null);
   const previewTimerRef = useRef<{ id: number; entryId: string } | null>(null);
   const previewEntriesRef = useRef<HubEntry[]>([]);
@@ -475,14 +615,17 @@ export function App() {
     );
     setPreview({ entry, serviceRule, target, anchorTop: rect.top, left, top: Math.max(PREVIEW_EDGE, rect.top) });
     if (entry.kind === "html") {
-      void getHtmlPreview(entry.id, entry.url).then((html) => {
-        setPreview((current) => current?.entry.id === entry.id ? { ...current, html } : current);
-      });
+      void import("./preview")
+        .then(({ getHtmlPreview }) => getHtmlPreview(entry.id, entry.url))
+        .then((html) => {
+          setPreview((current) => current?.entry.id === entry.id ? { ...current, html } : current);
+        });
     }
   }, [clearPreviewTimer]);
 
   const schedulePreview = useCallback((entry: HubEntry, serviceRule: ServiceRule | null, target: HTMLElement) => {
     clearPreviewTimer();
+    if (entry.kind === "html") void import("./preview");
     const id = window.setTimeout(() => {
       previewTimerRef.current = null;
       if (!target.isConnected || !target.matches(":hover")) return;
@@ -527,15 +670,37 @@ export function App() {
 
   useEffect(() => () => clearPreviewTimer(), [clearPreviewTimer]);
 
-  const loadIndex = useCallback(async () => {
-    const next = (await getNewTabIndex()) ?? (await rebuildNewTabIndex());
+  useEffect(() => {
+    const id = window.setTimeout(() => setControlsReady(true), 500);
+    return () => window.clearTimeout(id);
+  }, []);
+
+  useEffect(() => {
+    const update = () => setColumnCount((current) => {
+      const next = ledgerColumnCount();
+      return current === next ? current : next;
+    });
+    window.addEventListener("resize", update);
+    return () => window.removeEventListener("resize", update);
+  }, []);
+
+  const loadIndex = useCallback(async (fallbackEntries?: ReportEntry[]) => {
+    let next = await getNewTabIndex();
+    if (!next) {
+      const entries = fallbackEntries ?? await getLedgerEntriesOnly();
+      next = buildNewTabIndex(entries);
+      await chrome.storage.local.set({ [NEW_TAB_INDEX_KEY]: next });
+    }
     setIndex(next);
   }, []);
 
   const loadFullEntries = useCallback(async (): Promise<NewTabIndexEntry[]> => {
     if (fullLoadRef.current) return fullLoadRef.current;
-    fullLoadRef.current = getAllEntries()
-      .then((entries) => entries.filter((entry) => !entry.archived).map(compact))
+    fullLoadRef.current = getLedgerEntriesOnly()
+      .then((entries) => {
+        setLedgerPaths(entries.map((entry) => entry.path));
+        return entries.filter((entry) => !entry.archived).map(compact);
+      })
       .then((entries) => {
         setFullEntries(entries);
         return entries;
@@ -546,19 +711,39 @@ export function App() {
     return fullLoadRef.current;
   }, []);
 
-  const loadBookmarks = useCallback(async () => {
-    const tree = await chrome.bookmarks.getTree();
-    setBookmarkNodes(bookmarkBarChildren(tree));
-  }, []);
+  const ensureHubIndex = useCallback(async (): Promise<HubIndexState> => {
+    if (hubIndexState?.api && hubIndexState.snapshot && hubIndexState.api.isHubIndexSnapshotFresh(hubIndexState.snapshot)) {
+      return hubIndexState;
+    }
+    if (hubIndexState && (!hubIndexState.api || !hubIndexState.snapshot)) return hubIndexState;
+    if (hubIndexLoadRef.current) return hubIndexLoadRef.current;
+    const request = import("./hubindex")
+      .then(async (api): Promise<HubIndexState> => ({ api, snapshot: await api.loadHubIndex() }))
+      .catch((): HubIndexState => ({ api: null, snapshot: null }))
+      .then((state) => {
+        setHubIndexState(state);
+        return state;
+      })
+      .finally(() => {
+        hubIndexLoadRef.current = null;
+      });
+    hubIndexLoadRef.current = request;
+    return request;
+  }, [hubIndexState]);
 
-  const loadTabs = useCallback(async (currentSettings: Settings, rules: ServiceRule[]) => {
+  const readBookmarks = useCallback(async () => {
+    const tree = await chrome.bookmarks.getTree();
+    return bookmarkBarChildren(tree);
+  }, []);
+  const loadBookmarks = useCallback(async () => setBookmarkNodes(await readBookmarks()), [readBookmarks]);
+
+  const readTabs = useCallback(async (currentSettings: Settings, rules: ServiceRule[]) => {
     const tabs = await chrome.tabs.query({});
-    const next: HubEntry[] = [];
-    for (const tab of tabs) {
+    return (await Promise.all(tabs.map(async (tab): Promise<HubEntry | null> => {
       const norm = normalizeTarget(tab.url, currentSettings);
-      if (!norm || tab.id == null) continue;
+      if (!norm || tab.id == null) return null;
       const id = await entryIdFromKey(norm.key);
-      next.push({
+      return {
         id,
         url: norm.url,
         path: norm.path,
@@ -576,22 +761,49 @@ export function App() {
         tabId: tab.id,
         windowId: tab.windowId,
         chromePinned: tab.pinned
-      });
-    }
-    setOpenTabs(next);
+      };
+    }))).filter((entry): entry is HubEntry => entry !== null);
   }, []);
+  const loadTabs = useCallback(
+    async (currentSettings: Settings, rules: ServiceRule[]) => setOpenTabs(await readTabs(currentSettings, rules)),
+    [readTabs]
+  );
 
   useEffect(() => {
     document.title = S.documentTitle;
+    let cancelled = false;
     void (async () => {
-      await ensureSchemaV3();
-      const [currentSettings, entries] = await Promise.all([getSettings(), getAllEntries()]);
-      const currentRules = await promoteServiceRules(entries);
-      setSettings(currentSettings);
+      const bookmarksPromise = readBookmarks();
+      const bootstrap = await getNewTabBootstrap();
+      const needsMigration = bootstrap.schemaVersion !== 3 || !bootstrap.serviceRules;
+      const schemaPromise = needsMigration ? ensureSchemaV3() : Promise.resolve();
+      const currentRules: ServiceRulesStore = bootstrap.serviceRules ?? await schemaPromise.then(() => getServiceRules());
+      await Promise.all([
+        schemaPromise,
+        bootstrap.index ? Promise.resolve() : schemaPromise.then(() => loadIndex())
+      ]);
+      if (bootstrap.schemaVersion !== 3) await loadIndex();
+      if (cancelled) return;
+      const [initialTabs, initialBookmarks] = await Promise.all([
+        readTabs(bootstrap.settings, currentRules.rules),
+        bookmarksPromise
+      ]);
+      if (cancelled) return;
+      setSettings(bootstrap.settings);
       setServiceRules(currentRules);
-      await Promise.all([loadIndex(), loadTabs(currentSettings, currentRules.rules), loadBookmarks()]);
+      if (bootstrap.index) setIndex(bootstrap.index);
+      setOpenTabs(initialTabs);
+      setBookmarkNodes(initialBookmarks);
+      await new Promise<void>((resolve) => window.setTimeout(resolve, LEDGER_MAINTENANCE_DELAY_MS));
+      if (cancelled) return;
+      const entries = await getLedgerEntriesOnly();
+      const promotedRules = await promoteServiceRules(entries);
+      if (!cancelled && promotedRules.rules.length !== currentRules.rules.length) setServiceRules(promotedRules);
     })();
-  }, [loadBookmarks, loadIndex, loadTabs]);
+    return () => {
+      cancelled = true;
+    };
+  }, [loadIndex, readBookmarks, readTabs]);
 
   useEffect(() => {
     if (!settings) return;
@@ -639,12 +851,17 @@ export function App() {
   }, [fullEntries, loadFullEntries, query]);
 
   useEffect(() => {
+    if (!query.trim()) return;
+    void ensureHubIndex();
+  }, [ensureHubIndex, query]);
+
+  useEffect(() => {
     localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(layout));
   }, [layout]);
 
   const merged = useMemo(() => {
     const base = query.trim() && fullEntries ? fullEntries : index;
-    const byKey = new Map<string, HubEntry>(base.map((entry) => [entry.key, { ...entry }]));
+    const byKey = new Map<string, HubEntry>(base.map((entry) => [entry.key, entry]));
     for (const tab of openTabs) {
       const stored = byKey.get(tab.key);
       byKey.set(
@@ -689,15 +906,11 @@ export function App() {
   );
   previewEntriesRef.current = visibleEntries;
 
-  const kindCounts = useMemo(
-    () => ({
-      all: visibleEntries.length,
-      web: visibleEntries.filter((entry) => entry.kind === "web").length,
-      html: visibleEntries.filter((entry) => entry.kind === "html").length,
-      pdf: visibleEntries.filter((entry) => entry.kind === "pdf").length
-    }),
-    [visibleEntries]
-  );
+  const kindCounts = useMemo(() => {
+    const counts = { all: visibleEntries.length, web: 0, html: 0, pdf: 0 };
+    for (const entry of visibleEntries) counts[entry.kind] += 1;
+    return counts;
+  }, [visibleEntries]);
 
   const fallbackServiceRule = useMemo(
     () => serviceRules?.rules.find((rule) => rule.id === "other") ?? null,
@@ -768,13 +981,73 @@ export function App() {
       .sort((left, right) => right.count - left.count || (order.get(left.rule.id) ?? 0) - (order.get(right.rule.id) ?? 0));
   }, [getRuleForEntry, kindFilteredEntries, serviceRules]);
 
-  const filteredEntries = useMemo(() => {
+  const serviceFilteredEntries = useMemo(() => {
     const selected = new Set(layout.selectedServices);
     if (!selected.size || layout.kind === "html" || layout.kind === "pdf") return kindFilteredEntries;
     return kindFilteredEntries.filter(
       (entry) => entry.kind === "web" && selected.has(getRuleForEntry(entry)?.id ?? "other")
     );
   }, [getRuleForEntry, kindFilteredEntries, layout.kind, layout.selectedServices]);
+
+  const hubIndexMatches = useMemo<HubIndexDisplayMatch[]>(() => {
+    const api = hubIndexState?.api;
+    const snapshot = hubIndexState?.snapshot;
+    if (!query.trim() || !fullEntries || !api || !snapshot) return [];
+    const ledgerIdentities = new Set(
+      [...ledgerPaths, ...openTabs.map((entry) => entry.path)]
+        .map((path) => api.hubIndexIdentityFromPath(path))
+        .filter((identity): identity is string => Boolean(identity))
+    );
+    return api.searchHubIndex(snapshot.rows, query)
+      .filter((match) => {
+        const identity = api.hubIndexIdentityFromPath(match.row.p);
+        return !identity || !ledgerIdentities.has(identity);
+      })
+      .map((match) => ({ ...match, url: api.hubIndexRowUrl(match.row, snapshot.sourceUrl) }))
+      .filter((match): match is HubIndexDisplayMatch => typeof match.url === "string");
+  }, [fullEntries, hubIndexState, ledgerPaths, openTabs, query]);
+
+  const kindServiceHubMatches = useMemo(() => {
+    if ((layout.kind !== "all" && layout.kind !== "html") || (layout.kind === "all" && layout.selectedServices.length > 0)) return [];
+    return hubIndexMatches;
+  }, [hubIndexMatches, layout.kind, layout.selectedServices.length]);
+
+  const categoryChips = useMemo(() => {
+    if (!query.trim() && layout.selectedCategories.length === 0) return [];
+    const counts = new Map<string, number>();
+    if (layout.kind !== "web") {
+      for (const entry of serviceFilteredEntries) {
+        if (entry.kind === "web") continue;
+        const category = entry.group.trim().normalize("NFC");
+        if (category) counts.set(category, (counts.get(category) ?? 0) + 1);
+      }
+      for (const match of kindServiceHubMatches) {
+        const category = match.row.c;
+        if (category) counts.set(category, (counts.get(category) ?? 0) + 1);
+      }
+      for (const category of layout.selectedCategories) {
+        if (!counts.has(category)) counts.set(category, 0);
+      }
+    }
+    return [...counts]
+      .map(([category, count]) => ({ category, count }))
+      .sort((left, right) => right.count - left.count || left.category.localeCompare(right.category));
+  }, [kindServiceHubMatches, layout.kind, layout.selectedCategories, query, serviceFilteredEntries]);
+
+  const filteredEntries = useMemo(() => {
+    if (layout.kind === "web" || layout.selectedCategories.length === 0) return serviceFilteredEntries;
+    const selected = new Set(layout.selectedCategories);
+    return serviceFilteredEntries.filter((entry) => selected.has(entry.group.trim().normalize("NFC")));
+  }, [layout.kind, layout.selectedCategories, serviceFilteredEntries]);
+
+  const filteredHubIndexMatches = useMemo(() => {
+    if (layout.selectedCategories.length === 0) return kindServiceHubMatches;
+    const selected = new Set(layout.selectedCategories);
+    return kindServiceHubMatches.filter((match) => selected.has(match.row.c));
+  }, [kindServiceHubMatches, layout.selectedCategories]);
+
+  const visibleHubIndexMatches = filteredHubIndexMatches.slice(0, 40);
+  const remainingHubIndexMatches = filteredHubIndexMatches.length - visibleHubIndexMatches.length;
 
   const rowsByBand = useMemo(
     () => ({
@@ -853,6 +1126,21 @@ export function App() {
     setToast({ text: S.group.closedToast(entry.title, targets.length) });
   }, [openTabs, removeEntry]);
 
+  const handleRowOpen = useCallback((entry: HubEntry, band: Band) => {
+    hidePreview(entry.id, false);
+    void openEntry(entry, band);
+  }, [hidePreview, openEntry]);
+
+  const handleRowLater = useCallback((entry: HubEntry) => {
+    hidePreview(entry.id, false);
+    void moveLater(entry);
+  }, [hidePreview, moveLater]);
+
+  const handleRowClose = useCallback((entry: HubEntry, band: Band) => {
+    hidePreview(entry.id, false);
+    void closeEntry(entry, band);
+  }, [closeEntry, hidePreview]);
+
   const undoLater = useCallback(async () => {
     if (!toast?.undo) return;
     const { entry, ts } = toast.undo;
@@ -875,11 +1163,15 @@ export function App() {
         const full = await loadFullEntries();
         hasMatch = hasMatch || [...full, ...openTabs].some((entry) => searchText(entry).includes(needle));
       }
+      const currentHubIndex = await ensureHubIndex();
+      if (currentHubIndex.api && currentHubIndex.snapshot) {
+        hasMatch = hasMatch || currentHubIndex.api.searchHubIndex(currentHubIndex.snapshot.rows, text).length > 0;
+      }
       if (!hasMatch) {
         await chrome.search.query({ text, disposition: "CURRENT_TAB" });
       }
     },
-    [bookmarkMatches.length, fullEntries, loadFullEntries, merged.length, openTabs, query]
+    [bookmarkMatches.length, ensureHubIndex, fullEntries, loadFullEntries, merged.length, openTabs, query]
   );
 
   const selectKind = useCallback((kind: KindFilter) => {
@@ -895,6 +1187,15 @@ export function App() {
     });
   }, []);
 
+  const toggleCategory = useCallback((category: string) => {
+    setLayout((current) => {
+      const selected = new Set(current.selectedCategories);
+      if (selected.has(category)) selected.delete(category);
+      else selected.add(category);
+      return { ...current, selectedCategories: [...selected] };
+    });
+  }, []);
+
   const toggleBand = useCallback((band: CollapsibleBand) => {
     setLayout((current) => {
       const collapsed = new Set(current.collapsedBands);
@@ -905,6 +1206,10 @@ export function App() {
   }, []);
 
   const openBookmark = useCallback(async (url: string) => {
+    await chrome.tabs.create({ url, active: true });
+  }, []);
+
+  const openHubIndexEntry = useCallback(async (url: string) => {
     await chrome.tabs.create({ url, active: true });
   }, []);
 
@@ -987,6 +1292,15 @@ export function App() {
     });
   }, [getRuleForEntry]);
 
+  const groupsByBand = useMemo(
+    () => ({
+      open: groupRows(rowsByBand.open),
+      recent: groupRows(rowsByBand.recent),
+      later: groupRows(rowsByBand.later)
+    }),
+    [groupRows, rowsByBand]
+  );
+
   const toggleGroup = useCallback((key: string) => {
     setCollapsedGroups((current) => current.includes(key) ? current.filter((item) => item !== key) : [...current, key]);
   }, []);
@@ -1004,8 +1318,13 @@ export function App() {
 
   const renderLedgerBand = (band: Band) => {
     const rows = rowsByBand[band];
-    const groups = groupRows(rows);
+    const groups = groupsByBand[band];
     const collapsed = layout.collapsedBands.includes(band);
+    const groupColumns = splitGroupColumns(
+      groups,
+      columnCount,
+      (group) => collapsedGroups.includes(`${band}:${group.key}`)
+    );
     return (
       <section
         className="band"
@@ -1028,17 +1347,23 @@ export function App() {
           </button>
         </h3>
         {!collapsed && rows.length > 0 && (
-          <div className="band-rows" data-testid={`band-rows-${band}`}>
-            {groups.map((group) => {
-              const collapseKey = `${band}:${group.key}`;
-              const groupCollapsed = collapsedGroups.includes(collapseKey);
-              return (
-                <section className="hub-group" data-group-key={group.key} key={collapseKey}>
+          <div
+            className="band-rows ledger-band-rows"
+            data-testid={`band-rows-${band}`}
+            style={{ gridTemplateColumns: `repeat(${groupColumns.length}, minmax(0, 1fr))` }}
+          >
+            {groupColumns.map((column, columnIndex) => (
+              <div className="ledger-band-column" key={`${band}:column:${columnIndex}`}>
+                {column.map((group) => {
+                  const collapseKey = `${band}:${group.key}`;
+                  const groupCollapsed = collapsedGroups.includes(collapseKey);
+                  return (
+                    <section className="hub-group" data-group-key={group.key} key={collapseKey}>
                   <div className="group-header">
                     <span className={`group-dot group-dot-${group.kind}`} aria-hidden="true" />
                     <span className="group-title">{group.name}</span>
                     <span className="group-count">{group.entries.length}</span>
-                    <span className="group-actions">
+                    {controlsReady && <span className="group-actions">
                       <button
                         type="button"
                         className="group-collapse-action"
@@ -1062,7 +1387,7 @@ export function App() {
                           ×
                         </button>
                       )}
-                    </span>
+                    </span>}
                   </div>
                   {!groupCollapsed && group.entries.map((entry) => (
                     <AppRow
@@ -1070,23 +1395,17 @@ export function App() {
                       entry={entry}
                       band={band}
                       serviceRule={getRuleForEntry(entry)}
-                      onOpen={(item, itemBand) => {
-                        hidePreview(item.id, false);
-                        void openEntry(item, itemBand);
-                      }}
-                      onLater={(item) => {
-                        hidePreview(item.id, false);
-                        void moveLater(item);
-                      }}
-                      onClose={(item, itemBand) => {
-                        hidePreview(item.id, false);
-                        void closeEntry(item, itemBand);
-                      }}
+                      controlsReady={controlsReady}
+                      onOpen={handleRowOpen}
+                      onLater={handleRowLater}
+                      onClose={handleRowClose}
                     />
                   ))}
-                </section>
-              );
-            })}
+                    </section>
+                  );
+                })}
+              </div>
+            ))}
           </div>
         )}
       </section>
@@ -1188,7 +1507,7 @@ export function App() {
             </button>
           </div>
         </div>
-        {query.trim() && merged.length === 0 && bookmarkMatches.length === 0 && (
+        {query.trim() && hubIndexState && merged.length === 0 && bookmarkMatches.length === 0 && hubIndexMatches.length === 0 && (
           <p className="search-hint">{S.search.fallbackHint}</p>
         )}
         {(layout.kind === "all" || layout.kind === "web") && serviceChips.length > 0 && (
@@ -1208,6 +1527,29 @@ export function App() {
                 >
                   <span className="service-dot" style={ruleColorStyle(rule)} aria-hidden="true" />
                   <span>{rule.label}</span>
+                  <span className="service-count">{count}</span>
+                </button>
+              );
+            })}
+          </div>
+        )}
+        {(query.trim() || layout.selectedCategories.length > 0) && layout.kind !== "web" && categoryChips.length > 0 && (
+          <div className="service-chips category-chips" data-testid="category-chips" aria-label={S.category.label}>
+            <span className="category-chips-label">{S.category.label}</span>
+            {categoryChips.map(({ category, count }) => {
+              const selected = layout.selectedCategories.includes(category);
+              return (
+                <button
+                  key={category}
+                  type="button"
+                  className="service-chip category-chip"
+                  data-testid={`category-chip-${category}`}
+                  data-category={category}
+                  data-count={count}
+                  aria-pressed={selected}
+                  onClick={() => toggleCategory(category)}
+                >
+                  <span>{category}</span>
                   <span className="service-count">{count}</span>
                 </button>
               );
@@ -1278,8 +1620,40 @@ export function App() {
                 )}
               </section>
             )}
+            {query.trim() && filteredHubIndexMatches.length > 0 && (
+              <section
+                className="band hub-index-band"
+                data-testid="band-hub-index"
+                data-collapsed={layout.collapsedBands.includes("hubIndex") ? "true" : "false"}
+              >
+                <h3>
+                  <button
+                    type="button"
+                    data-testid="band-toggle-hub-index"
+                    title={layout.collapsedBands.includes("hubIndex") ? S.band.expand : S.band.collapse}
+                    aria-expanded={!layout.collapsedBands.includes("hubIndex")}
+                    onClick={() => toggleBand("hubIndex")}
+                  >
+                    <span aria-hidden="true">{layout.collapsedBands.includes("hubIndex") ? "▸" : "▾"}</span>
+                    <span><span aria-hidden="true">📚</span> {S.hubIndex.band}</span>
+                    <span className="band-count" data-testid="band-count-hub-index">{filteredHubIndexMatches.length}</span>
+                    <span className="band-line" aria-hidden="true" />
+                  </button>
+                </h3>
+                {!layout.collapsedBands.includes("hubIndex") && (
+                  <div className="band-rows" data-testid="band-rows-hub-index">
+                    {visibleHubIndexMatches.map((match) => (
+                      <HubIndexResult key={match.row.i} match={match} onOpen={(url) => void openHubIndexEntry(url)} />
+                    ))}
+                    {remainingHubIndexMatches > 0 && (
+                      <p className="hub-index-more" data-testid="hub-index-more">{S.hubIndex.more(remainingHubIndexMatches)}</p>
+                    )}
+                  </div>
+                )}
+              </section>
+            )}
             {renderLedgerBand("later")}
-            {filteredEntries.length === 0 && bookmarkMatches.length === 0 && (
+            {filteredEntries.length === 0 && bookmarkMatches.length === 0 && filteredHubIndexMatches.length === 0 && (
               <p className="empty-list" data-testid="empty-filtered">
                 {S.empty.filtered(S.kind[layout.kind])}
               </p>

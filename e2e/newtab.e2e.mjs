@@ -1,17 +1,77 @@
 // HTML Hub new-tab E2E (CDP, zero dependencies, Node 24 WebSocket).
 import { spawn, spawnSync } from "node:child_process";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
+import { HUB_INDEX_CACHE_KEY, HUB_INDEX_SETTINGS_KEY } from "../src/newtab/hubindex.ts";
 import { S } from "../src/newtab/strings.ts";
 
 const CHROME = "C:/Users/miyaz/tools/chrome-for-testing/chrome/win64-150.0.7871.115/chrome-win64/chrome.exe";
 const DIST = "C:/Users/miyaz/html-editor-extension/dist";
 const PROFILE = `C:/Users/miyaz/html-editor-extension/e2e/e2e-profile/newtab-${process.pid}-${Date.now()}`;
 const PORT = 9600 + (process.pid % 300);
+const CDP_COMMAND_TIMEOUT_MS = 30000;
 const FILE_HTML = "file:///C:/Users/miyaz/html-editor-extension/src/newtab/index.html";
 const WEB_URL = "https://example.com/";
 const PDF_URL = "https://example.com/y.pdf";
 const REPEAT_URL = `https://example.com/?hub-e2e=${Date.now()}`;
 // Commit 7b4e5da, same 140-row fixture and performance.now() sample: 358.7, 336.0, 345.9 ms (median 345.9).
 const V013_DENSE_RENDER_BASELINE_MS = 345.9;
+// Parent-verified v0.14.0 (abd804b) render time under the accepted 140-row lane.
+const V014_HUB_INDEX_RENDER_BASELINE_MS = 368.7;
+
+const HUB_INDEX_SMALL_PATH = join(PROFILE, "hub-index-small", "mobile", "search.json");
+const HUB_INDEX_PERF_PATH = join(PROFILE, "hub-index-perf", "mobile", "search.json");
+const HUB_INDEX_MISSING_PATH = join(PROFILE, "hub-index-missing", "mobile", "search.json");
+const HUB_INDEX_SMALL_URL = pathToFileURL(HUB_INDEX_SMALL_PATH).href;
+const HUB_INDEX_PERF_URL = pathToFileURL(HUB_INDEX_PERF_PATH).href;
+const HUB_INDEX_MISSING_URL = pathToFileURL(HUB_INDEX_MISSING_PATH).href;
+
+function hubIndexFixtureRow({ id, title, description = "", category = "FixtureCase", tags = [], prefix = "report" }) {
+  return {
+    i: id,
+    t: title,
+    d: description,
+    c: category,
+    r: "knowledge",
+    m: "2026-08-31T00:00:00+09:00",
+    p: `docs/${prefix}__${id}.html`,
+    f: false,
+    g: tags,
+    s: "fixture"
+  };
+}
+
+const HUB_INDEX_FIXTURE_IDS = {
+  description: "111111111111",
+  tag: "222222222222",
+  duplicate: "333333333333",
+  dedupControl: "444444444444",
+  unifiedA: "555555555555",
+  unifiedB: "666666666666",
+  otherCase: "777777777777"
+};
+const hubIndexSmallRows = [
+  hubIndexFixtureRow({ id: HUB_INDEX_FIXTURE_IDS.description, title: "Description-only document", description: "The hidden descneedle appears only in this description." }),
+  hubIndexFixtureRow({ id: HUB_INDEX_FIXTURE_IDS.tag, title: "Tag-only document", tags: ["tagneedle"] }),
+  hubIndexFixtureRow({ id: HUB_INDEX_FIXTURE_IDS.duplicate, title: "dedupneedle duplicate", prefix: "duplicate" }),
+  hubIndexFixtureRow({ id: HUB_INDEX_FIXTURE_IDS.dedupControl, title: "dedupneedle control", prefix: "control" }),
+  hubIndexFixtureRow({ id: HUB_INDEX_FIXTURE_IDS.unifiedA, title: "casefilter unified one", category: "UnifiedCase" }),
+  hubIndexFixtureRow({ id: HUB_INDEX_FIXTURE_IDS.unifiedB, title: "casefilter unified two", category: "UnifiedCase", tags: ["one", "two", "three", "four"] }),
+  hubIndexFixtureRow({ id: HUB_INDEX_FIXTURE_IDS.otherCase, title: "casefilter other", category: "OtherCase" }),
+  ...Array.from({ length: 43 }, (_, index) => {
+    const id = (0x800000 + index).toString(16).padStart(12, "0");
+    return hubIndexFixtureRow({ id, title: `capneedle result ${String(index).padStart(2, "0")}`, category: "CapCase", prefix: `cap-${index}` });
+  })
+];
+const hubIndexPerfRows = Array.from({ length: 4000 }, (_, index) => {
+  const id = (0x1000000 + index).toString(16).padStart(12, "0");
+  return hubIndexFixtureRow({ id, title: `perfcommon ${index}`, category: `PerfCase${index % 8}`, prefix: `perf-${index}` });
+});
+mkdirSync(dirname(HUB_INDEX_SMALL_PATH), { recursive: true });
+mkdirSync(dirname(HUB_INDEX_PERF_PATH), { recursive: true });
+writeFileSync(HUB_INDEX_SMALL_PATH, JSON.stringify(hubIndexSmallRows), "utf8");
+writeFileSync(HUB_INDEX_PERF_PATH, JSON.stringify(hubIndexPerfRows), "utf8");
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -41,7 +101,7 @@ class CDP {
         if (!this.pending.has(id)) return;
         this.pending.delete(id);
         reject(new Error(`${method}: timeout`));
-      }, 15000);
+      }, CDP_COMMAND_TIMEOUT_MS);
     });
   }
 }
@@ -65,12 +125,12 @@ async function evalIn(cdp, sessionId, expression, retries = 5) {
   }
 }
 
-async function waitFor(fn, timeoutMs = 15000) {
+async function waitFor(fn, timeoutMs = 15000, intervalMs = 250) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const value = await fn();
     if (value) return value;
-    await sleep(250);
+    await sleep(intervalMs);
   }
   return null;
 }
@@ -146,7 +206,9 @@ async function openHub(cdp, control, extensionId, { initScript = "" } = {}) {
       sessionId,
       `document.title === ${JSON.stringify(S.documentTitle)} ? { title: document.title, href: location.href } : null`,
       1
-    )
+    ),
+    15000,
+    25
   );
   if (!ready) {
     const { targetInfos } = await cdp.send("Target.getTargets");
@@ -160,7 +222,9 @@ async function openHub(cdp, control, extensionId, { initScript = "" } = {}) {
       sessionId,
       "document.querySelector('[data-testid=\"hub-shell\"]')?.dataset.ready === 'true'",
       1
-    )
+    ),
+    15000,
+    25
   );
   if (!appReady) throw new Error("new-tab app did not become ready");
   return { targetId, sessionId };
@@ -246,11 +310,19 @@ function stableStringify(value) {
 
 async function closeHubTargets(cdp) {
   const { targetInfos } = await cdp.send("Target.getTargets");
+  const closing = [];
   for (const target of targetInfos) {
     if (target.type === "page" && target.url.includes("/src/newtab/index.html")) {
+      closing.push(target.targetId);
       await cdp.send("Target.closeTarget", { targetId: target.targetId });
     }
   }
+  if (!closing.length) return;
+  const closed = await waitFor(async () => {
+    const current = await cdp.send("Target.getTargets");
+    return closing.every((targetId) => !current.targetInfos.some((target) => target.targetId === targetId));
+  }, 5000);
+  if (!closed) throw new Error(`new-tab targets did not close: ${closing.join(",")}`);
 }
 
 async function resetHubFixture(cdp, controlSession, { clearRules = false, closeTabs = true } = {}) {
@@ -261,12 +333,48 @@ async function resetHubFixture(cdp, controlSession, { clearRules = false, closeT
     `(async () => {
       localStorage.removeItem('tabhub:layout');
       const all = await chrome.storage.local.get(null);
-      const keys = Object.keys(all).filter((key) => key.startsWith('entry:') || key.startsWith('excerpt:') || key === 'index:newtab' || key === 'index:panel'${clearRules ? " || key === 'serviceRules'" : ""});
+      const keys = Object.keys(all).filter((key) => key.startsWith('entry:') || key.startsWith('excerpt:') || key === 'index:newtab' || key === 'index:panel' || key === ${JSON.stringify(HUB_INDEX_CACHE_KEY)}${clearRules ? " || key === 'serviceRules'" : ""});
       if (keys.length) await chrome.storage.local.remove(keys);
       ${closeTabs ? "const current = await chrome.tabs.getCurrent(); const tabs = await chrome.tabs.query({}); const ids = tabs.filter((tab) => tab.id !== current.id && !tab.url?.startsWith('chrome://')).map((tab) => tab.id); if (ids.length) await chrome.tabs.remove(ids);" : ""}
       return true;
     })()`
   );
+}
+
+async function setSearchQuery(cdp, sessionId, value) {
+  return evalIn(
+    cdp,
+    sessionId,
+    `(() => {
+      const input = document.querySelector('[data-testid="hub-search"]');
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+      setter.call(input, ${JSON.stringify(value)});
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      return input.value;
+    })()`,
+    1
+  );
+}
+
+function hubIndexSpyScript(urls) {
+  return `(() => {
+    const watched = new Set(${JSON.stringify(urls)});
+    const nativeFetch = globalThis.fetch.bind(globalThis);
+    globalThis.__hubIndexFetches = [];
+    globalThis.__hubIndexErrors = [];
+    globalThis.fetch = (input, init) => {
+      const url = typeof input === 'string' ? input : input.url;
+      if (!watched.has(url)) return nativeFetch(input, init);
+      const call = { url, at: performance.now(), settled: false };
+      globalThis.__hubIndexFetches.push(call);
+      return nativeFetch(input, init).then(
+        (response) => { call.settled = true; return response; },
+        (error) => { call.settled = true; call.error = String(error); throw error; }
+      );
+    };
+    addEventListener('error', (event) => globalThis.__hubIndexErrors.push(String(event.error ?? event.message)));
+    addEventListener('unhandledrejection', (event) => globalThis.__hubIndexErrors.push(String(event.reason)));
+  })();`;
 }
 
 async function hoverEntry(cdp, sessionId, entryId) {
@@ -349,6 +457,9 @@ try {
       if (removable.length) await chrome.tabs.remove(removable);
       await chrome.storage.local.clear();
       await chrome.storage.session.clear();
+      await chrome.storage.local.set({
+        [${JSON.stringify(HUB_INDEX_SETTINGS_KEY)}]: { sourceUrl: ${JSON.stringify(HUB_INDEX_SMALL_URL)} }
+      });
       return true;
     })()`
   );
@@ -1323,29 +1434,40 @@ try {
     `chrome.storage.local.set({ ...${JSON.stringify(entryRecord(devServiceGroupEntries))}, 'index:newtab': ${JSON.stringify(devServiceGroupEntries)} })`
   );
   hub = await openHub(cdp, control, extensionId);
-  const devServiceGroupState = await waitFor(() =>
+  const devServiceGroupReady = await waitFor(() =>
     evalIn(
       cdp,
       hub.sessionId,
-      `(() => {
-        const fixtureIds = new Set(${JSON.stringify(devServiceGroupEntries.map((entry) => entry.id))});
-        const groups = [...document.querySelectorAll('[data-testid="band-recent"] .hub-group')].map((group) => ({
-          name: group.querySelector('.group-title')?.textContent?.trim(),
-          count: Number(group.querySelector('.group-count')?.textContent),
-          ids: [...group.querySelectorAll('[data-entry-id]')].map((row) => row.dataset.entryId).filter((id) => fixtureIds.has(id))
-        })).filter((group) => group.ids.length > 0);
-        return groups.flatMap((group) => group.ids).length === fixtureIds.size ? groups : null;
-      })()`,
+      `Number(document.querySelector('[data-testid="band-count-recent"]')?.textContent) === ${devServiceGroupEntries.length}`,
       1
     )
   );
+  const devServiceGroupState = await evalIn(
+    cdp,
+    hub.sessionId,
+    `new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => {
+      const fixtureIds = new Set(${JSON.stringify(devServiceGroupEntries.map((entry) => entry.id))});
+      const groups = [...document.querySelectorAll('[data-testid="band-recent"] .hub-group')].map((group) => ({
+        name: group.querySelector('.group-title')?.textContent?.trim(),
+        count: Number(group.querySelector('.group-count')?.textContent),
+        ids: [...group.querySelectorAll('[data-entry-id]')].map((row) => row.dataset.entryId).filter((id) => fixtureIds.has(id))
+      })).filter((group) => group.ids.length > 0);
+      resolve({
+        recentCount: Number(document.querySelector('[data-testid="band-count-recent"]')?.textContent ?? -1),
+        layout: JSON.parse(localStorage.getItem('tabhub:layout') ?? 'null'),
+        groups
+      });
+    })))`,
+    1
+  );
   check(
     "x0. five singleton dev hosts stay in one service group",
-    devServiceGroupState?.length === 1 &&
-      devServiceGroupState[0].name === S.service.dev &&
-      devServiceGroupState[0].count === 5 &&
-      devServiceGroupState[0].ids.length === 5 &&
-      devServiceGroupState[0].name !== S.group.misc,
+    Boolean(devServiceGroupReady) &&
+      devServiceGroupState?.groups.length === 1 &&
+      devServiceGroupState.groups[0].name === S.service.dev &&
+      devServiceGroupState.groups[0].count === 5 &&
+      devServiceGroupState.groups[0].ids.length === 5 &&
+      devServiceGroupState.groups[0].name !== S.group.misc,
     JSON.stringify(devServiceGroupState)
   );
 
@@ -1377,34 +1499,45 @@ try {
     `chrome.storage.local.set({ ...${JSON.stringify(entryRecord(devHostSplitEntries))}, 'index:newtab': ${JSON.stringify(devHostSplitEntries)} })`
   );
   hub = await openHub(cdp, control, extensionId);
-  const devHostSplitState = await waitFor(() =>
+  const devHostSplitReady = await waitFor(() =>
     evalIn(
       cdp,
       hub.sessionId,
-      `(() => {
-        const fixtureIds = new Set(${JSON.stringify(devHostSplitEntries.map((entry) => entry.id))});
-        const groups = [...document.querySelectorAll('[data-testid="band-recent"] .hub-group')].map((group) => ({
-          name: group.querySelector('.group-title')?.textContent?.trim(),
-          count: Number(group.querySelector('.group-count')?.textContent),
-          ids: [...group.querySelectorAll('[data-entry-id]')].map((row) => row.dataset.entryId).filter((id) => fixtureIds.has(id))
-        })).filter((group) => group.ids.length > 0);
-        return groups.flatMap((group) => group.ids).length === fixtureIds.size ? groups : null;
-      })()`,
+      `Number(document.querySelector('[data-testid="band-count-recent"]')?.textContent) === ${devHostSplitEntries.length}`,
       1
     )
   );
-  const splitHostGroup = devHostSplitState?.find((group) => group.name === splitDevHost);
-  const devRemainderGroup = devHostSplitState?.find((group) => group.name === S.service.dev);
+  const devHostSplitState = await evalIn(
+    cdp,
+    hub.sessionId,
+    `new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => {
+      const fixtureIds = new Set(${JSON.stringify(devHostSplitEntries.map((entry) => entry.id))});
+      const groups = [...document.querySelectorAll('[data-testid="band-recent"] .hub-group')].map((group) => ({
+        name: group.querySelector('.group-title')?.textContent?.trim(),
+        count: Number(group.querySelector('.group-count')?.textContent),
+        ids: [...group.querySelectorAll('[data-entry-id]')].map((row) => row.dataset.entryId).filter((id) => fixtureIds.has(id))
+      })).filter((group) => group.ids.length > 0);
+      resolve({
+        recentCount: Number(document.querySelector('[data-testid="band-count-recent"]')?.textContent ?? -1),
+        layout: JSON.parse(localStorage.getItem('tabhub:layout') ?? 'null'),
+        groups
+      });
+    })))`,
+    1
+  );
+  const splitHostGroup = devHostSplitState?.groups.find((group) => group.name === splitDevHost);
+  const devRemainderGroup = devHostSplitState?.groups.find((group) => group.name === S.service.dev);
   const splitHostIds = devHostSplitEntries.slice(0, 4).map((entry) => entry.id).sort();
   const devRemainderIds = devHostSplitEntries.slice(4).map((entry) => entry.id).sort();
   check(
     "y0. frequent dev host splits from the service remainder",
-    devHostSplitState?.length === 2 &&
+    Boolean(devHostSplitReady) &&
+      devHostSplitState?.groups.length === 2 &&
       splitHostGroup?.count === 4 &&
       JSON.stringify(splitHostGroup.ids.sort()) === JSON.stringify(splitHostIds) &&
       devRemainderGroup?.count === 2 &&
       JSON.stringify(devRemainderGroup.ids.sort()) === JSON.stringify(devRemainderIds) &&
-      !devHostSplitState.some((group) => group.name === S.group.misc),
+      !devHostSplitState.groups.some((group) => group.name === S.group.misc),
     JSON.stringify(devHostSplitState)
   );
 
@@ -1526,8 +1659,14 @@ try {
   await leaveHubRows(cdp, hub.sessionId);
   const hiddenAfterLeave = await evalIn(cdp, hub.sessionId, "!document.querySelector('[data-testid=\"preview-card\"]')", 1);
   await hoverEntry(cdp, hub.sessionId, "preview-callout");
-  await sleep(225);
-  const cachedHoverState = await evalIn(
+  const cachedHoverState = await waitFor(() => evalIn(
+    cdp,
+    hub.sessionId,
+    `document.querySelector('[data-testid="preview-excerpt"]')?.textContent === ${JSON.stringify(calloutText)}
+      ? ({ fetches: globalThis.__previewFetchState.calls.length, excerpt: document.querySelector('[data-testid="preview-excerpt"]')?.textContent })
+      : null`,
+    1
+  )) ?? await evalIn(
     cdp,
     hub.sessionId,
     "({ fetches: globalThis.__previewFetchState.calls.length, excerpt: document.querySelector('[data-testid=\"preview-excerpt\"]')?.textContent })",
@@ -1665,6 +1804,256 @@ try {
   );
 
   await resetHubFixture(cdp, control.sessionId);
+  const hubSmallRoot = dirname(dirname(HUB_INDEX_SMALL_PATH));
+  const duplicateRow = hubIndexSmallRows.find((row) => row.i === HUB_INDEX_FIXTURE_IDS.duplicate);
+  const duplicateUrl = pathToFileURL(join(hubSmallRoot, duplicateRow.p)).href;
+  const hubLedgerEntries = [
+    fixtureEntry({ id: "hub-ledger-duplicate", url: duplicateUrl, kind: "html", group: "DuplicateCase", title: "dedupneedle ledger copy" }),
+    fixtureEntry({ id: "hub-ledger-category", url: "file:///C:/e2e/hub-index/casefilter-ledger.html", kind: "html", group: "UnifiedCase", title: "casefilter ledger document" }),
+    fixtureEntry({ id: "hub-ledger-normal", url: "file:///C:/e2e/hub-index/ledger-normal.html", kind: "html", group: "LedgerCase", title: "ledgerneedle normal document" })
+  ];
+  await evalIn(
+    cdp,
+    control.sessionId,
+    `chrome.storage.local.set({
+      ...${JSON.stringify(entryRecord(hubLedgerEntries))},
+      'index:newtab': ${JSON.stringify(hubLedgerEntries)},
+      [${JSON.stringify(HUB_INDEX_SETTINGS_KEY)}]: { sourceUrl: ${JSON.stringify(HUB_INDEX_SMALL_URL)} }
+    })`
+  );
+  const hubIndexSpy = hubIndexSpyScript([HUB_INDEX_SMALL_URL, HUB_INDEX_MISSING_URL, HUB_INDEX_PERF_URL]);
+  hub = await openHub(cdp, control, extensionId, { initScript: hubIndexSpy });
+  await sleep(250);
+  const afState = await evalIn(
+    cdp,
+    hub.sessionId,
+    `({ fetches: globalThis.__hubIndexFetches.filter((item) => item.url === ${JSON.stringify(HUB_INDEX_SMALL_URL)}).length, band: Boolean(document.querySelector('[data-testid="band-hub-index"]')) })`,
+    1
+  );
+  check("af. initial render does not read the hub index", afState.fetches === 0 && !afState.band, JSON.stringify(afState));
+
+  await setSearchQuery(cdp, hub.sessionId, "descneedle");
+  const agShown = await waitFor(() =>
+    evalIn(cdp, hub.sessionId, "Boolean(document.querySelector('[data-testid=\"band-hub-index\"]'))", 1)
+  );
+  await setSearchQuery(cdp, hub.sessionId, "");
+  const agHidden = await waitFor(() =>
+    evalIn(cdp, hub.sessionId, "!document.querySelector('[data-testid=\"band-hub-index\"]')", 1)
+  );
+  check("ag. query shows the hub band and clearing removes it from the DOM", Boolean(agShown) && Boolean(agHidden), `shown=${Boolean(agShown)} hidden=${Boolean(agHidden)}`);
+
+  await setSearchQuery(cdp, hub.sessionId, "descneedle");
+  const ahState = await waitFor(() =>
+    evalIn(
+      cdp,
+      hub.sessionId,
+      `(() => {
+        const row = document.querySelector('[data-hub-index-id=${JSON.stringify(HUB_INDEX_FIXTURE_IDS.description)}]');
+        return row ? { title: row.querySelector('.hub-index-title')?.textContent, fetches: globalThis.__hubIndexFetches.length } : null;
+      })()`,
+      1
+    )
+  );
+  check("ah. description-only text finds a hub document", ahState?.title === "Description-only document" && !ahState.title.includes("descneedle"), JSON.stringify(ahState));
+
+  await setSearchQuery(cdp, hub.sessionId, "tagneedle");
+  const aiState = await waitFor(() =>
+    evalIn(
+      cdp,
+      hub.sessionId,
+      `(() => {
+        const row = document.querySelector('[data-hub-index-id=${JSON.stringify(HUB_INDEX_FIXTURE_IDS.tag)}]');
+        return row ? { title: row.querySelector('.hub-index-title')?.textContent, meta: row.querySelector('.hub-index-meta')?.textContent } : null;
+      })()`,
+      1
+    )
+  );
+  check("ai. tag-only text finds a hub document", aiState?.title === "Tag-only document" && aiState.meta?.includes("tagneedle"), JSON.stringify(aiState));
+
+  await setSearchQuery(cdp, hub.sessionId, "dedupneedle");
+  const ajState = await waitFor(() =>
+    evalIn(
+      cdp,
+      hub.sessionId,
+      `(() => {
+        const ledger = document.querySelector('[data-entry-id="hub-ledger-duplicate"]');
+        const duplicate = document.querySelector('[data-hub-index-id=${JSON.stringify(HUB_INDEX_FIXTURE_IDS.duplicate)}]');
+        const control = document.querySelector('[data-hub-index-id=${JSON.stringify(HUB_INDEX_FIXTURE_IDS.dedupControl)}]');
+        return ledger && control ? { ledger: true, duplicate: Boolean(duplicate), control: true } : null;
+      })()`,
+      1
+    )
+  );
+  check("aj. ledger files are not duplicated in the hub band", ajState?.ledger && !ajState.duplicate && ajState.control, JSON.stringify(ajState));
+
+  await setSearchQuery(cdp, hub.sessionId, "capneedle");
+  const akState = await waitFor(() =>
+    evalIn(
+      cdp,
+      hub.sessionId,
+      `(() => {
+        const band = document.querySelector('[data-testid="band-hub-index"]');
+        const rows = band?.querySelectorAll('[data-hub-index-id]');
+        const count = document.querySelector('[data-testid="band-count-hub-index"]')?.textContent;
+        const more = document.querySelector('[data-testid="hub-index-more"]')?.textContent;
+        return rows?.length === 40 ? { rows: rows.length, count, more } : null;
+      })()`,
+      1
+    )
+  );
+  check("ak. hub results stop at 40 and report the remainder", akState?.rows === 40 && akState.count === "43" && akState.more === S.hubIndex.more(3), JSON.stringify(akState));
+
+  await setSearchQuery(cdp, hub.sessionId, "casefilter");
+  const amBefore = await waitFor(() =>
+    evalIn(
+      cdp,
+      hub.sessionId,
+      `(() => {
+        const unified = document.querySelector('.category-chip[data-category="UnifiedCase"]');
+        const other = document.querySelector('.category-chip[data-category="OtherCase"]');
+        return unified && other ? { unified: Number(unified.dataset.count), other: Number(other.dataset.count) } : null;
+      })()`,
+      1
+    )
+  );
+  await evalIn(cdp, hub.sessionId, "document.querySelector('.category-chip[data-category=\"UnifiedCase\"]').click()", 1);
+  const amAfter = await waitFor(() =>
+    evalIn(
+      cdp,
+      hub.sessionId,
+      `(() => {
+        const hubRows = [...document.querySelectorAll('[data-testid="band-hub-index"] [data-hub-index-id]')];
+        const ledger = Boolean(document.querySelector('[data-entry-id="hub-ledger-category"]'));
+        const other = Boolean(document.querySelector('[data-hub-index-id=${JSON.stringify(HUB_INDEX_FIXTURE_IDS.otherCase)}]'));
+        const layout = JSON.parse(localStorage.getItem('tabhub:layout') ?? 'null');
+        return hubRows.length === 2 && ledger && !other && layout?.selectedCategories?.includes('UnifiedCase')
+          ? { hubRows: hubRows.length, ledger, other, selected: layout.selectedCategories }
+          : null;
+      })()`,
+      1
+    )
+  );
+  check("am. category chips merge ledger and hub counts and filter as an AND axis", amBefore?.unified === 3 && amBefore.other === 1 && amAfter?.hubRows === 2 && amAfter.ledger && !amAfter.other, `before=${JSON.stringify(amBefore)} after=${JSON.stringify(amAfter)}`);
+
+  await closeHubTargets(cdp);
+  hub = await openHub(cdp, control, extensionId, { initScript: hubIndexSpy });
+  await setSearchQuery(cdp, hub.sessionId, "casefilter");
+  const anState = await waitFor(() =>
+    evalIn(
+      cdp,
+      hub.sessionId,
+      `(() => {
+        const rows = document.querySelectorAll('[data-testid="band-hub-index"] [data-hub-index-id]').length;
+        const selected = document.querySelector('.category-chip[data-category="UnifiedCase"]')?.getAttribute('aria-pressed');
+        return rows === 2 ? { rows, selected, fetches: globalThis.__hubIndexFetches.length } : null;
+      })()`,
+      1
+    )
+  );
+  check("an. a second search uses the six-hour storage cache without refetching", anState?.rows === 2 && anState.selected === "true" && anState.fetches === 0, JSON.stringify(anState));
+
+  await evalIn(
+    cdp,
+    hub.sessionId,
+    `(() => {
+      const nativeNow = Date.now.bind(Date);
+      Date.now = () => nativeNow() + 6 * 60 * 60 * 1000 + 1;
+    })()`,
+    1
+  );
+  await setSearchQuery(cdp, hub.sessionId, "descneedle");
+  const an2State = await waitFor(() =>
+    evalIn(
+      cdp,
+      hub.sessionId,
+      `(async () => {
+        const call = globalThis.__hubIndexFetches.find((item) => item.url === ${JSON.stringify(HUB_INDEX_SMALL_URL)});
+        const stored = (await chrome.storage.local.get(${JSON.stringify(HUB_INDEX_CACHE_KEY)}))[${JSON.stringify(HUB_INDEX_CACHE_KEY)}];
+        return call?.settled && stored?.fetchedAt > ${Date.now()}
+          ? { fetches: globalThis.__hubIndexFetches.length, settled: call.settled, rows: stored.rows?.length }
+          : null;
+      })()`,
+      1
+    )
+  );
+  check("an2. the next search refetches after the six-hour TTL", an2State?.fetches === 1 && an2State.settled && an2State.rows === hubIndexSmallRows.length, JSON.stringify(an2State));
+
+  await closeHubTargets(cdp);
+  await evalIn(
+    cdp,
+    control.sessionId,
+    `(async () => {
+      await chrome.storage.local.remove(${JSON.stringify(HUB_INDEX_CACHE_KEY)});
+      await chrome.storage.local.set({ [${JSON.stringify(HUB_INDEX_SETTINGS_KEY)}]: { sourceUrl: ${JSON.stringify(HUB_INDEX_MISSING_URL)} } });
+      localStorage.removeItem('tabhub:layout');
+    })()`
+  );
+  hub = await openHub(cdp, control, extensionId, { initScript: hubIndexSpy });
+  await waitFor(() =>
+    evalIn(cdp, hub.sessionId, "Boolean(document.querySelector('[data-entry-id=\"hub-ledger-normal\"]'))", 1)
+  );
+  await setSearchQuery(cdp, hub.sessionId, "ledgerneedle");
+  await evalIn(
+    cdp,
+    hub.sessionId,
+    "new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))",
+    1
+  );
+  const alState = await waitFor(() =>
+    evalIn(
+      cdp,
+      hub.sessionId,
+      `(() => {
+        const ledger = Boolean(document.querySelector('[data-entry-id="hub-ledger-normal"]'));
+        const calls = globalThis.__hubIndexFetches.filter((item) => item.url === ${JSON.stringify(HUB_INDEX_MISSING_URL)});
+        if (!ledger || calls.length !== 1 || !calls[0].settled) return null;
+        document.querySelector('[data-testid="kind-tab-html"]')?.click();
+        return true;
+      })()`,
+      1
+    ),
+    30000
+  );
+  const alSettledState = alState && await waitFor(() =>
+    evalIn(
+      cdp,
+      hub.sessionId,
+      `(() => {
+        const selected = document.querySelector('[data-testid="kind-tab-html"]')?.getAttribute('aria-selected');
+        const ledger = Boolean(document.querySelector('[data-entry-id="hub-ledger-normal"]'));
+        return selected === 'true' && ledger ? {
+          ledger,
+          fetches: globalThis.__hubIndexFetches.filter((item) => item.url === ${JSON.stringify(HUB_INDEX_MISSING_URL)}).length,
+          settled: globalThis.__hubIndexFetches.find((item) => item.url === ${JSON.stringify(HUB_INDEX_MISSING_URL)})?.settled,
+          band: Boolean(document.querySelector('[data-testid="band-hub-index"]')),
+          ready: document.querySelector('[data-testid="hub-shell"]')?.dataset.ready,
+          errors: globalThis.__hubIndexErrors.length
+        } : null;
+      })()`,
+      1
+    )
+  );
+  const alDiagnostic = alSettledState ?? await evalIn(
+    cdp,
+    hub.sessionId,
+    `({
+      ledger: Boolean(document.querySelector('[data-entry-id="hub-ledger-normal"]')),
+      query: document.querySelector('[data-testid="hub-search"]')?.value,
+      fetches: globalThis.__hubIndexFetches.filter((item) => item.url === ${JSON.stringify(HUB_INDEX_MISSING_URL)}),
+      band: Boolean(document.querySelector('[data-testid="band-hub-index"]')),
+      ready: document.querySelector('[data-testid="hub-shell"]')?.dataset.ready,
+      errors: globalThis.__hubIndexErrors
+    })`,
+    1
+  );
+  check("al. a missing index silently omits only the hub band", alSettledState?.ledger && alSettledState.fetches === 1 && alSettledState.settled && !alSettledState.band && alSettledState.ready === "true" && alSettledState.errors === 0, JSON.stringify(alDiagnostic));
+
+  await evalIn(
+    cdp,
+    control.sessionId,
+    `chrome.storage.local.remove(${JSON.stringify([HUB_INDEX_CACHE_KEY, HUB_INDEX_SETTINGS_KEY])})`
+  );
+  await resetHubFixture(cdp, control.sessionId);
   const groupCloseUrls = [
     `https://example.com/v-group-a-${Date.now()}`,
     `https://example.com/v-group-b-${Date.now()}`
@@ -1754,9 +2143,13 @@ try {
   await evalIn(
     cdp,
     control.sessionId,
-    `chrome.storage.local.set({ ...${JSON.stringify(entryRecord(densityEntries))}, 'index:newtab': ${JSON.stringify(densityEntries)} })`
+    `chrome.storage.local.set({
+      ...${JSON.stringify(entryRecord(densityEntries))},
+      'index:newtab': ${JSON.stringify(densityEntries)},
+      [${JSON.stringify(HUB_INDEX_SETTINGS_KEY)}]: { sourceUrl: ${JSON.stringify(HUB_INDEX_PERF_URL)} }
+    })`
   );
-  hub = await openHub(cdp, control, extensionId);
+  hub = await openHub(cdp, control, extensionId, { initScript: hubIndexSpyScript([HUB_INDEX_PERF_URL]) });
   await cdp.send(
     "Emulation.setDeviceMetricsOverride",
     { width: 1680, height: 1000, deviceScaleFactor: 1, mobile: false },
@@ -1787,6 +2180,35 @@ try {
       densityState.groups === 20 &&
       densityState.renderMs < V013_DENSE_RENDER_BASELINE_MS * 1.1,
     `${JSON.stringify(densityState)} baselineMs=${V013_DENSE_RENDER_BASELINE_MS} limitMs=${(V013_DENSE_RENDER_BASELINE_MS * 1.1).toFixed(1)}`
+  );
+
+  const perfInitialFetches = await evalIn(cdp, hub.sessionId, "globalThis.__hubIndexFetches.length", 1);
+  await setSearchQuery(cdp, hub.sessionId, "perfcommon");
+  const hubIndexPerfState = await waitFor(() =>
+    evalIn(
+      cdp,
+      hub.sessionId,
+      `(() => {
+        const band = document.querySelector('[data-testid="band-hub-index"]');
+        const rows = band?.querySelectorAll('[data-hub-index-id]').length;
+        const total = Number(document.querySelector('[data-testid="band-count-hub-index"]')?.textContent);
+        const more = document.querySelector('[data-testid="hub-index-more"]')?.textContent;
+        const fetches = globalThis.__hubIndexFetches.length;
+        return rows === 40 && total === 4000 ? { rows, total, more, fetches } : null;
+      })()`,
+      1
+    ),
+    30000
+  );
+  check(
+    "q2. 4000-row hub fixture adds no initial read or v0.14 render regression",
+    perfInitialFetches === 0 &&
+      hubIndexPerfState?.rows === 40 &&
+      hubIndexPerfState.total === 4000 &&
+      hubIndexPerfState.more === S.hubIndex.more(3960) &&
+      hubIndexPerfState.fetches === 1 &&
+      densityState?.renderMs < V014_HUB_INDEX_RENDER_BASELINE_MS * 1.1,
+    `render=${densityState?.renderMs} baselineMs=${V014_HUB_INDEX_RENDER_BASELINE_MS} limitMs=${(V014_HUB_INDEX_RENDER_BASELINE_MS * 1.1).toFixed(1)} initialFetches=${perfInitialFetches} search=${JSON.stringify(hubIndexPerfState)}`
   );
 
   if (openedBookmarkTabs?.length) {

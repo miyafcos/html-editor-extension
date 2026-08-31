@@ -63,6 +63,34 @@ export const S = {
     misc: "その他"
   },
 
+  /** Hover preview card. Excerpts are only available for local .html targets. */
+  preview: {
+    /** Relative time, e.g. 「3日前」. Called with whole days; 0 means today. */
+    ago: (days: number) => (days <= 0 ? "さっき" : days === 1 ? "きのう" : `${days}日前`),
+    visits: (n: number) => `${n}回`,
+    pinned: "常設",
+    later: "あとで",
+    /** Separator-led line summarising document shape, e.g. 見出し8 · 表3 (最大44行) */
+    shapeHeadings: (n: number) => `見出し${n}`,
+    shapeTables: (n: number, maxRows: number) => `表${n}（最大${maxRows}行）`,
+    shapeChips: (ok: number, warn: number, ng: number) => `✓${ok} ⚠${warn} ✕${ng}`,
+    shapeFigures: (n: number) => `図${n}`
+  },
+
+  /** Search results drawn from the HTML hub index (read-only, local mirror). */
+  hubIndex: {
+    band: "ハブ資料",
+    /** Shown when the match count exceeds the display cap. */
+    more: (n: number) => `他 ${n} 件`,
+    /** Extra tags beyond the first three. */
+    moreTags: (n: number) => `+${n}`
+  },
+
+  /** Case-category chips, merged from the ledger group and the hub index category. */
+  category: {
+    label: "案件でしぼる"
+  },
+
   /** Bookmark strip (bookmark_bar children) and the search-only bookmark band. */
   bookmarks: {
     lead: "ブックマーク",

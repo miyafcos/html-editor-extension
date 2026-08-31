@@ -1280,6 +1280,111 @@ try {
   check("t. html-only kind filter removes the service chip row from DOM", Boolean(serviceStripGone));
 
   await resetHubFixture(cdp, control.sessionId);
+  const distinctDevHosts = [
+    "github.com",
+    "gitlab.com",
+    "stackoverflow.com",
+    "developer.mozilla.org",
+    "developer.chrome.com"
+  ];
+  const devServiceGroupEntries = distinctDevHosts.map((host, index) => fixtureEntry({
+    id: `x-dev-service-${index}`,
+    url: `https://${host}/e2e/service-group-${index}`,
+    service: "dev",
+    title: `dev service group ${index}`
+  }));
+  await evalIn(
+    cdp,
+    control.sessionId,
+    `chrome.storage.local.set({ ...${JSON.stringify(entryRecord(devServiceGroupEntries))}, 'index:newtab': ${JSON.stringify(devServiceGroupEntries)} })`
+  );
+  hub = await openHub(cdp, control, extensionId);
+  const devServiceGroupState = await waitFor(() =>
+    evalIn(
+      cdp,
+      hub.sessionId,
+      `(() => {
+        const fixtureIds = new Set(${JSON.stringify(devServiceGroupEntries.map((entry) => entry.id))});
+        const groups = [...document.querySelectorAll('[data-testid="band-recent"] .hub-group')].map((group) => ({
+          name: group.querySelector('.group-title')?.textContent?.trim(),
+          count: Number(group.querySelector('.group-count')?.textContent),
+          ids: [...group.querySelectorAll('[data-entry-id]')].map((row) => row.dataset.entryId).filter((id) => fixtureIds.has(id))
+        })).filter((group) => group.ids.length > 0);
+        return groups.flatMap((group) => group.ids).length === fixtureIds.size ? groups : null;
+      })()`,
+      1
+    )
+  );
+  check(
+    "x. five singleton dev hosts stay in one service group",
+    devServiceGroupState?.length === 1 &&
+      devServiceGroupState[0].name === S.service.dev &&
+      devServiceGroupState[0].count === 5 &&
+      devServiceGroupState[0].ids.length === 5 &&
+      devServiceGroupState[0].name !== S.group.misc,
+    JSON.stringify(devServiceGroupState)
+  );
+
+  await resetHubFixture(cdp, control.sessionId);
+  const splitDevHost = "github.com";
+  const devHostSplitEntries = [
+    ...Array.from({ length: 4 }, (_, index) => fixtureEntry({
+      id: `y-dev-host-${index}`,
+      url: `https://${splitDevHost}/e2e/host-group-${index}`,
+      service: "dev",
+      title: `dev host group ${index}`
+    })),
+    fixtureEntry({
+      id: "y-dev-service-gitlab",
+      url: "https://gitlab.com/e2e/service-remainder",
+      service: "dev",
+      title: "dev service remainder gitlab"
+    }),
+    fixtureEntry({
+      id: "y-dev-service-stackoverflow",
+      url: "https://stackoverflow.com/questions/e2e-service-remainder",
+      service: "dev",
+      title: "dev service remainder stackoverflow"
+    })
+  ];
+  await evalIn(
+    cdp,
+    control.sessionId,
+    `chrome.storage.local.set({ ...${JSON.stringify(entryRecord(devHostSplitEntries))}, 'index:newtab': ${JSON.stringify(devHostSplitEntries)} })`
+  );
+  hub = await openHub(cdp, control, extensionId);
+  const devHostSplitState = await waitFor(() =>
+    evalIn(
+      cdp,
+      hub.sessionId,
+      `(() => {
+        const fixtureIds = new Set(${JSON.stringify(devHostSplitEntries.map((entry) => entry.id))});
+        const groups = [...document.querySelectorAll('[data-testid="band-recent"] .hub-group')].map((group) => ({
+          name: group.querySelector('.group-title')?.textContent?.trim(),
+          count: Number(group.querySelector('.group-count')?.textContent),
+          ids: [...group.querySelectorAll('[data-entry-id]')].map((row) => row.dataset.entryId).filter((id) => fixtureIds.has(id))
+        })).filter((group) => group.ids.length > 0);
+        return groups.flatMap((group) => group.ids).length === fixtureIds.size ? groups : null;
+      })()`,
+      1
+    )
+  );
+  const splitHostGroup = devHostSplitState?.find((group) => group.name === splitDevHost);
+  const devRemainderGroup = devHostSplitState?.find((group) => group.name === S.service.dev);
+  const splitHostIds = devHostSplitEntries.slice(0, 4).map((entry) => entry.id).sort();
+  const devRemainderIds = devHostSplitEntries.slice(4).map((entry) => entry.id).sort();
+  check(
+    "y. frequent dev host splits from the service remainder",
+    devHostSplitState?.length === 2 &&
+      splitHostGroup?.count === 4 &&
+      JSON.stringify(splitHostGroup.ids.sort()) === JSON.stringify(splitHostIds) &&
+      devRemainderGroup?.count === 2 &&
+      JSON.stringify(devRemainderGroup.ids.sort()) === JSON.stringify(devRemainderIds) &&
+      !devHostSplitState.some((group) => group.name === S.group.misc),
+    JSON.stringify(devHostSplitState)
+  );
+
+  await resetHubFixture(cdp, control.sessionId);
   const groupCloseUrls = [
     `https://example.com/v-group-a-${Date.now()}`,
     `https://example.com/v-group-b-${Date.now()}`

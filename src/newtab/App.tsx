@@ -26,7 +26,6 @@ import {
 import {
   entryIdFromKey,
   fileName,
-  hostDisplayName,
   inferGroup,
   inferService,
   matchServiceRule,
@@ -802,42 +801,54 @@ export function App() {
   const ledgerCount = (query.trim() && fullEntries ? fullEntries : index).length;
 
   const groupRows = useCallback((rows: HubEntry[]): HubGroup[] => {
-    const byKey = new Map<string, HubGroup>();
+    const staged = new Map<string, HubGroup>();
     for (const entry of rows) {
       let key: string;
       let name: string;
       if (entry.kind === "web") {
         const rule = getRuleForEntry(entry);
-        const host = serviceHostname(entry.url) ?? entry.key;
-        key = `web:${host}`;
-        name = rule?.origin === "auto" || rule?.origin === "user"
-          ? rule.label
-          : hostDisplayName(entry.url);
+        key = `web:service:${rule?.id ?? "other"}`;
+        name = rule?.label ?? S.service.other;
       } else {
         name = entry.group === FALLBACK_GROUP ? S.group.misc : entry.group;
         key = `${entry.kind}:${name}`;
       }
-      const group = byKey.get(key);
+      const group = staged.get(key);
       if (group) group.entries.push(entry);
-      else byKey.set(key, { key, name, kind: entry.kind, entries: [entry] });
+      else staged.set(key, { key, name, kind: entry.kind, entries: [entry] });
     }
 
-    const groups = [...byKey.values()];
-    const nameCounts = new Map<string, number>();
-    for (const group of groups) nameCounts.set(group.name, (nameCounts.get(group.name) ?? 0) + 1);
-    for (const group of groups) {
-      if (group.kind !== "web" || (nameCounts.get(group.name) ?? 0) < 2) continue;
-      const label = getRuleForEntry(group.entries[0])?.label;
-      if (label) group.name = `${group.name} · ${label}`;
-    }
-    const singles = groups.filter((group) => group.entries.length === 1);
-    if (singles.length < 2) return groups;
-    const remaining = groups.filter((group) => group.entries.length !== 1);
-    const misc = remaining.find((group) => group.name === S.group.misc);
-    const singleEntries = singles.flatMap((group) => group.entries);
-    if (misc) misc.entries.push(...singleEntries);
-    else remaining.push({ key: "misc:singletons", name: S.group.misc, kind: singles[0].kind, entries: singleEntries });
-    return remaining;
+    return [...staged.values()].flatMap((group) => {
+      if (group.kind !== "web") return [group];
+
+      const hostCounts = new Map<string, number>();
+      for (const entry of group.entries) {
+        const host = serviceHostname(entry.url);
+        if (host) hostCounts.set(host, (hostCounts.get(host) ?? 0) + 1);
+      }
+      const splitHosts = new Set(
+        [...hostCounts].filter(([, count]) => count >= 3).map(([host]) => host)
+      );
+      if (!splitHosts.size) return [group];
+
+      const hostGroups = new Map<string, HubGroup>();
+      const serviceEntries: HubEntry[] = [];
+      for (const entry of group.entries) {
+        const host = serviceHostname(entry.url);
+        if (!host || !splitHosts.has(host)) {
+          serviceEntries.push(entry);
+          continue;
+        }
+        const key = `${group.key}:host:${host}`;
+        const hostGroup = hostGroups.get(key);
+        if (hostGroup) hostGroup.entries.push(entry);
+        else hostGroups.set(key, { key, name: host, kind: entry.kind, entries: [entry] });
+      }
+
+      const groups = [...hostGroups.values()];
+      if (serviceEntries.length) groups.push({ ...group, entries: serviceEntries });
+      return groups;
+    });
   }, [getRuleForEntry]);
 
   const toggleGroup = useCallback((key: string) => {

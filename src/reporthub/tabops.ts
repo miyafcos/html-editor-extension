@@ -1,6 +1,6 @@
 import type { Settings, UndoSnapshot } from "./types";
-import type { NormalizedFile } from "./url";
-import { isTargetFile, normalizeFileUrl } from "./url";
+import type { NormalizedFile, NormalizedTarget } from "./url";
+import { isTargetFile, normalizeFileUrl, normalizeTarget } from "./url";
 
 /** storage.local key for the やりなおし (undo) snapshot of the last close op. */
 export const UNDO_KEY = "undo:lastClosed";
@@ -135,24 +135,91 @@ async function groupTabIds(
   settings: Settings,
   collapse: boolean
 ): Promise<void> {
+  await groupTabIdsByLabel(
+    tabIds,
+    windowId,
+    settings.tabGroupTitle,
+    settings.tabGroupColor,
+    collapse
+  );
+}
+
+async function groupTabIdsByLabel(
+  tabIds: number[],
+  windowId: number,
+  title: string,
+  color: chrome.tabGroups.ColorEnum,
+  collapse: boolean
+): Promise<void> {
   if (!tabIds.length) return;
-  const existing = await chrome.tabGroups.query({ windowId, title: settings.tabGroupTitle });
+  const existing = await chrome.tabGroups.query({ windowId, title });
   let groupId: number;
   if (existing.length) {
     groupId = existing[0].id;
     await chrome.tabs.group({ tabIds, groupId });
-    await chrome.tabGroups.update(groupId, { color: settings.tabGroupColor });
+    await chrome.tabGroups.update(groupId, { title, color });
   } else {
     groupId = await chrome.tabs.group({
       tabIds,
       createProperties: { windowId }
     });
     await chrome.tabGroups.update(groupId, {
-      title: settings.tabGroupTitle,
-      color: settings.tabGroupColor
+      title,
+      color
     });
   }
   if (collapse) await collapseGroup(groupId, windowId);
+}
+
+type HubKind = NormalizedTarget["kind"];
+
+const HUB_GROUPS: Record<
+  HubKind,
+  { title: string; color: chrome.tabGroups.ColorEnum }
+> = {
+  web: { title: "Web", color: "blue" },
+  html: { title: "HTML", color: "green" },
+  pdf: { title: "PDF", color: "red" }
+};
+
+/** Group every supported tab in the hub's window by kind and collapse each group. */
+export async function collapseHubTabs(
+  settings: Settings,
+  windowId: number,
+  hubTabId: number
+): Promise<number> {
+  const byKind: Record<HubKind, number[]> = { web: [], html: [], pdf: [] };
+  const tabs = await chrome.tabs.query({ windowId });
+  for (const tab of tabs) {
+    if (tab.id == null || tab.id === hubTabId || tab.pinned) continue;
+    const norm = normalizeTarget(tab.url, settings);
+    if (norm) byKind[norm.kind].push(tab.id);
+  }
+
+  let count = 0;
+  for (const kind of Object.keys(HUB_GROUPS) as HubKind[]) {
+    const tabIds = byKind[kind];
+    if (!tabIds.length) continue;
+    const group = HUB_GROUPS[kind];
+    await groupTabIdsByLabel(tabIds, windowId, group.title, group.color, true);
+    count += tabIds.length;
+  }
+  return count;
+}
+
+/** Expand the kind groups managed by the new-tab hub. Returns their tab count. */
+export async function expandHubTabs(windowId: number): Promise<number> {
+  const titles = new Set(Object.values(HUB_GROUPS).map((group) => group.title));
+  const groups = (await chrome.tabGroups.query({ windowId })).filter((group) =>
+    titles.has(group.title ?? "")
+  );
+  if (!groups.length) return 0;
+  const groupIds = new Set(groups.map((group) => group.id));
+  const tabs = await chrome.tabs.query({ windowId });
+  await Promise.all(
+    groups.map((group) => chrome.tabGroups.update(group.id, { collapsed: false }))
+  );
+  return tabs.filter((tab) => groupIds.has(tab.groupId)).length;
 }
 
 /** Collapse a group; if every unpinned tab is inside it Chrome refuses, so park on a new tab first. */

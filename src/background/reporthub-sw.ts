@@ -15,11 +15,13 @@ import {
   upsertVisit
 } from "../reporthub/repo";
 import {
+  collapseHubTabs,
   closeDuplicateTabs,
   closeReportTabs,
   discardIdleReportTabs,
   discardKey,
   discardReportTabs,
+  expandHubTabs,
   listReportTabs,
   openEntries,
   openTabSet,
@@ -30,7 +32,10 @@ import {
 } from "../reporthub/tabops";
 import { isTargetFile, normalizeFileUrl, normalizeTarget } from "../reporthub/url";
 
-const RH_TYPES = new Set<Msg["type"]>([
+type HubTabstripMsg = { type: "collapse-hub-tabs" } | { type: "expand-hub-tabs" };
+type ReportHubMsg = Msg | HubTabstripMsg;
+
+const RH_TYPES = new Set<ReportHubMsg["type"]>([
   "organize-tabs",
   "toggle-collapse",
   "close-duplicate-tabs",
@@ -41,7 +46,9 @@ const RH_TYPES = new Set<Msg["type"]>([
   "open-entries",
   "save-tabset",
   "open-tabset",
-  "run-backfill"
+  "run-backfill",
+  "collapse-hub-tabs",
+  "expand-hub-tabs"
 ]);
 
 const visitKey = (tabId: number) => `tabvisit:${tabId}`;
@@ -178,7 +185,7 @@ export function initReportHub(): void {
   });
 
   chrome.runtime.onMessage.addListener(
-    (msg: Msg, sender, sendResponse: (r: MsgResponse) => void) => {
+    (msg: ReportHubMsg, sender, sendResponse: (r: MsgResponse) => void) => {
       if (sender.id !== chrome.runtime.id) return;
       if (!msg || typeof msg !== "object" || !RH_TYPES.has(msg.type)) return;
       void (async () => {
@@ -186,6 +193,19 @@ export function initReportHub(): void {
           await schemaReady;
           const settings = await getSettings();
           switch (msg.type) {
+            case "collapse-hub-tabs": {
+              if (sender.tab?.id == null) throw new Error("Hub tab id is unavailable");
+              sendResponse({
+                ok: true,
+                count: await collapseHubTabs(settings, sender.tab.windowId, sender.tab.id)
+              });
+              break;
+            }
+            case "expand-hub-tabs": {
+              if (sender.tab == null) throw new Error("Hub tab window is unavailable");
+              sendResponse({ ok: true, count: await expandHubTabs(sender.tab.windowId) });
+              break;
+            }
             case "organize-tabs":
               sendResponse({ ok: true, count: await organizeTabs(settings, msg.collapse) });
               break;

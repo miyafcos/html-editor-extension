@@ -24,25 +24,51 @@ export const S = {
     empty: "ピン留めしたタブと、📌 を付けたページがここに並ぶ"
   },
 
-  /** Column headings (kind axis). */
+  /** Kind names. Used by the kind filter tabs and by row badges. */
   kind: {
+    all: "すべて",
     web: "Web",
     html: "HTML",
     pdf: "PDF"
   },
 
-  /** Band headings inside each column (revisit-frequency axis). */
+  /** Tab bar controls above the list. */
+  tabs: {
+    /** Screen-reader label for the kind filter tab strip. */
+    label: "種別でしぼる",
+    /** title attribute on each tab: e.g. 「Web だけ表示 (18件)」 */
+    hint: (kind: string, count: number) => `${kind} だけ表示（${count}件）`,
+    allHint: (count: number) => `すべて表示（${count}件）`
+  },
+
+  /** Collapse / expand the real Chrome tab strip. */
+  tabstrip: {
+    collapse: "まとめる",
+    collapseHint: "開いているタブを種別ごとにまとめて畳む",
+    expand: "展開",
+    expandHint: "畳んだタブグループを開き直す",
+    collapsedToast: (n: number) => `${n}件のタブを畳んだ`,
+    expandedToast: (n: number) => `${n}件のタブを展開した`,
+    nothingToCollapse: "畳めるタブがない"
+  },
+
+  /** Band headings (revisit-frequency axis). */
   band: {
     open: "いま開いてる",
     recent: "最近",
-    later: "あとで"
+    later: "あとで",
+    /** title attribute on the ▾/▸ toggle. */
+    collapse: "この帯を畳む",
+    expand: "この帯を開く"
   },
 
   /** Empty-state text per band. Never render a bare zero. */
   empty: {
-    open: "このタブは開いていない",
+    open: "開いているタブはない",
     recent: "2回以上開いたページがここに溜まる",
-    later: "🕐 で閉じたページがここで待つ"
+    later: "🕐 で閉じたページがここで待つ",
+    /** Shown when a kind filter yields nothing at all. */
+    filtered: (kind: string) => `${kind} はまだ何もない`
   },
 
   /** Row action buttons (used as title/aria-label). */

@@ -496,9 +496,9 @@ try {
     `tabs=${restoredLater?.tabs?.length ?? 0} later=${restoredLater?.found?.entry.later}`
   );
 
-  await openTab(cdp, control.sessionId, FILE_HTML);
-  await openTab(cdp, control.sessionId, PDF_URL);
-  await openTab(cdp, control.sessionId, WEB_URL);
+  const htmlTab = await openTab(cdp, control.sessionId, FILE_HTML);
+  const pdfTab = await openTab(cdp, control.sessionId, PDF_URL);
+  const webTab = await openTab(cdp, control.sessionId, WEB_URL);
   const chromeTab = await openTab(cdp, control.sessionId, "chrome://version/");
   const kinds = await waitFor(async () => {
     const [html, pdf, web] = await Promise.all([
@@ -589,6 +589,172 @@ try {
       migratedTwice.entry?.laterAt === null &&
       countAfterSecondRun === countBeforeSecondRun,
     `before=${countBeforeSecondRun} after=${countAfterSecondRun}`
+  );
+
+  await evalIn(
+    cdp,
+    hub.sessionId,
+    `document.querySelector('[data-testid="kind-tab-web"]').click()`,
+    1
+  );
+  const webFilter = await waitFor(() =>
+    evalIn(
+      cdp,
+      hub.sessionId,
+      `(() => {
+        const selected = document.querySelector('[data-testid="kind-tab-web"]')?.getAttribute('aria-selected') === 'true';
+        const rows = [...document.querySelectorAll('.hub-row')];
+        return selected && rows.length > 0
+          ? {
+              total: rows.length,
+              web: rows.filter((row) => row.dataset.kind === 'web').length,
+              html: rows.filter((row) => row.dataset.kind === 'html').length,
+              pdf: rows.filter((row) => row.dataset.kind === 'pdf').length
+            }
+          : null;
+      })()`,
+      1
+    )
+  );
+  check(
+    "g. kind tab keeps only matching rows in DOM",
+    webFilter?.total > 0 && webFilter.web === webFilter.total && webFilter.html === 0 && webFilter.pdf === 0,
+    JSON.stringify(webFilter)
+  );
+
+  const openCountBeforeCollapse = await evalIn(
+    cdp,
+    hub.sessionId,
+    `Number(document.querySelector('[data-testid="band-count-open"]')?.textContent ?? -1)`,
+    1
+  );
+  await evalIn(
+    cdp,
+    hub.sessionId,
+    `document.querySelector('[data-testid="band-toggle-open"]').click()`,
+    1
+  );
+  const collapsedBand = await waitFor(() =>
+    evalIn(
+      cdp,
+      hub.sessionId,
+      `(() => {
+        const band = document.querySelector('[data-testid="band-open"]');
+        const count = Number(document.querySelector('[data-testid="band-count-open"]')?.textContent ?? -1);
+        return band?.dataset.collapsed === 'true' && !document.querySelector('[data-testid="band-rows-open"]')
+          ? { before: ${openCountBeforeCollapse}, count, header: Boolean(document.querySelector('[data-testid="band-toggle-open"]')) }
+          : null;
+      })()`,
+      1
+    )
+  );
+  check(
+    "h. band collapse keeps heading and count",
+    collapsedBand?.header === true && collapsedBand.before >= 0 && collapsedBand.count === collapsedBand.before,
+    JSON.stringify(collapsedBand)
+  );
+
+  const hubTabId = await evalIn(cdp, hub.sessionId, "chrome.tabs.getCurrent().then((tab) => tab.id)", 1);
+  await evalIn(
+    cdp,
+    hub.sessionId,
+    `document.querySelector('[data-testid="tabstrip-collapse"]')?.click()`,
+    1
+  );
+  const collapsedGroups = await waitFor(() =>
+    evalIn(
+      cdp,
+      control.sessionId,
+      `(async () => {
+        const fixture = await Promise.all([${webTab}, ${htmlTab}, ${pdfTab}].map((id) => chrome.tabs.get(id)));
+        const hubTab = await chrome.tabs.get(${hubTabId});
+        if (fixture.some((tab) => tab.groupId < 0)) return null;
+        const groups = await Promise.all(fixture.map((tab) => chrome.tabGroups.get(tab.groupId)));
+        return groups.every((group) => group.collapsed)
+          ? {
+              hubGroupId: hubTab.groupId,
+              groups: groups.map((group) => ({ title: group.title, color: group.color, collapsed: group.collapsed }))
+            }
+          : null;
+      })()`,
+      1
+    )
+  );
+  const expectedGroups = [
+    { title: "Web", color: "blue" },
+    { title: "HTML", color: "green" },
+    { title: "PDF", color: "red" }
+  ];
+  check(
+    "i. collapse groups tabs by kind and excludes hub",
+    collapsedGroups?.hubGroupId < 0 &&
+      expectedGroups.every((expected, index) =>
+        collapsedGroups.groups[index]?.title === expected.title &&
+        collapsedGroups.groups[index]?.color === expected.color &&
+        collapsedGroups.groups[index]?.collapsed === true
+      ),
+    JSON.stringify(collapsedGroups)
+  );
+
+  await evalIn(
+    cdp,
+    hub.sessionId,
+    `document.querySelector('[data-testid="tabstrip-expand"]')?.click()`,
+    1
+  );
+  const expandedGroups = await waitFor(() =>
+    evalIn(
+      cdp,
+      control.sessionId,
+      `(async () => {
+        const fixture = await Promise.all([${webTab}, ${htmlTab}, ${pdfTab}].map((id) => chrome.tabs.get(id)));
+        if (fixture.some((tab) => tab.groupId < 0)) return null;
+        const groups = await Promise.all(fixture.map((tab) => chrome.tabGroups.get(tab.groupId)));
+        return groups.every((group) => !group.collapsed)
+          ? groups.map((group) => ({ title: group.title, collapsed: group.collapsed }))
+          : null;
+      })()`,
+      1
+    )
+  );
+  check(
+    "j. expand reopens kind groups",
+    expandedGroups?.length === 3 && expandedGroups.every((group) => group.collapsed === false),
+    JSON.stringify(expandedGroups)
+  );
+
+  const layoutStored = await waitFor(() =>
+    evalIn(
+      cdp,
+      hub.sessionId,
+      `(() => {
+        const value = JSON.parse(localStorage.getItem('tabhub:layout') ?? 'null');
+        return value?.kind === 'web' && value?.collapsedBands?.includes('open') ? value : null;
+      })()`,
+      1
+    )
+  );
+  await cdp.send("Target.closeTarget", { targetId: hub.targetId });
+  hub = await openHub(cdp, control, extensionId);
+  const restoredLayout = await waitFor(() =>
+    evalIn(
+      cdp,
+      hub.sessionId,
+      `(() => {
+        const selected = document.querySelector('[data-testid="kind-tab-web"]')?.getAttribute('aria-selected') === 'true';
+        const band = document.querySelector('[data-testid="band-open"]');
+        const count = Number(document.querySelector('[data-testid="band-count-open"]')?.textContent ?? -1);
+        return selected && band?.dataset.collapsed === 'true' && !document.querySelector('[data-testid="band-rows-open"]')
+          ? { selected, collapsed: true, count }
+          : null;
+      })()`,
+      1
+    )
+  );
+  check(
+    "k. kind and band layout persist across reopen",
+    Boolean(layoutStored) && restoredLayout?.selected === true && restoredLayout.collapsed === true && restoredLayout.count >= 0,
+    `stored=${JSON.stringify(layoutStored)} restored=${JSON.stringify(restoredLayout)}`
   );
 
   console.log(JSON.stringify({ ok: results.every((result) => result.ok), extensionId, results }, null, 2));

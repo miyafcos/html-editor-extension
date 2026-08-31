@@ -19,6 +19,8 @@ export interface ReportEntry {
   missingCheckedAt: number | null;
   source: "live" | "backfill" | "import";
   kind: "web" | "html" | "pdf";
+  /** Sub-classification of web targets. Always "other" for html/pdf kinds. */
+  service: ServiceId;
   later: boolean;
   laterAt: number | null;
 }
@@ -37,9 +39,60 @@ export type NewTabIndexEntry = Pick<
   | "pinned"
   | "archived"
   | "kind"
+  | "service"
   | "later"
   | "laterAt"
 >;
+
+export type ServiceId =
+  | "sheet"
+  | "drive"
+  | "ai"
+  | "dev"
+  | "comm"
+  | "internal"
+  | "doc"
+  | "search"
+  | "study"
+  | "media"
+  | "shop"
+  | "gov"
+  | "other";
+
+export type ServiceColorToken =
+  | "--svc-sheet"
+  | "--svc-doc"
+  | "--svc-drive"
+  | "--svc-ai"
+  | "--svc-dev"
+  | "--svc-comm"
+  | "--svc-internal"
+  | "--svc-search"
+  | "--svc-study"
+  | "--svc-media"
+  | "--svc-shop"
+  | "--svc-gov"
+  | "--svc-other";
+
+export interface ServiceRuleMatch {
+  host?: string[];
+  hostSuffix?: string[];
+  pathPrefix?: Array<{ host: string; prefix: string }>;
+}
+
+export interface ServiceRule {
+  id: string;
+  label: string;
+  match: ServiceRuleMatch;
+  color: ServiceColorToken;
+  origin: "seed" | "auto" | "user";
+  hits: number;
+}
+
+export interface ServiceRulesStore {
+  version: number;
+  rules: ServiceRule[];
+}
 
 export interface GroupRule {
   /** Regex (case-insensitive) applied to ReportEntry.path. */
@@ -67,7 +120,7 @@ export interface UndoSnapshot {
 }
 
 export interface Meta {
-  schemaVersion: 2;
+  schemaVersion: 3;
   backfillDoneAt: number | null;
 }
 

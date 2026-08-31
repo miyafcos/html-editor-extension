@@ -196,6 +196,76 @@ function chromeArgs(port) {
   ];
 }
 
+function fixtureEntry({ id, url, kind = "web", service = "other", group = "fixture", title = id, at = Date.now() }) {
+  let path = url;
+  try {
+    const parsed = new URL(url);
+    path = parsed.protocol === "file:" ? parsed.pathname : `${parsed.host}${parsed.pathname}`;
+  } catch {
+    // Keep the raw fixture URL as its display path.
+  }
+  return {
+    id,
+    url,
+    path,
+    key: url.toLowerCase(),
+    title,
+    group,
+    firstSeenAt: at - 1000,
+    lastSeenAt: at,
+    visitCount: 2,
+    pinned: false,
+    archived: false,
+    missing: false,
+    missingCheckedAt: at,
+    source: "import",
+    kind,
+    service,
+    later: false,
+    laterAt: null
+  };
+}
+
+function entryRecord(entries) {
+  return Object.fromEntries(entries.map((entry) => [`entry:${entry.id}`, entry]));
+}
+
+function stableStringify(value) {
+  const normalize = (item) => {
+    if (Array.isArray(item)) return item.map(normalize);
+    if (item && typeof item === "object") {
+      return Object.fromEntries(Object.keys(item).sort().map((key) => [key, normalize(item[key])]));
+    }
+    return item;
+  };
+  return JSON.stringify(normalize(value));
+}
+
+async function closeHubTargets(cdp) {
+  const { targetInfos } = await cdp.send("Target.getTargets");
+  for (const target of targetInfos) {
+    if (target.type === "page" && target.url.includes("/src/newtab/index.html")) {
+      await cdp.send("Target.closeTarget", { targetId: target.targetId });
+    }
+  }
+}
+
+async function resetHubFixture(cdp, controlSession, { clearRules = false, closeTabs = true } = {}) {
+  await closeHubTargets(cdp);
+  await evalIn(
+    cdp,
+    controlSession,
+    `(async () => {
+      localStorage.removeItem('tabhub:layout');
+      const all = await chrome.storage.local.get(null);
+      const keys = Object.keys(all).filter((key) => key.startsWith('entry:') || key === 'index:newtab' || key === 'index:panel'${clearRules ? " || key === 'serviceRules'" : ""});
+      if (keys.length) await chrome.storage.local.remove(keys);
+      ${closeTabs ? "const current = await chrome.tabs.getCurrent(); const tabs = await chrome.tabs.query({}); const ids = tabs.filter((tab) => tab.id !== current.id && !tab.url?.startsWith('chrome://')).map((tab) => tab.id); if (ids.length) await chrome.tabs.remove(ids);" : ""}
+      return true;
+    })()`
+  );
+}
+
 async function stopProcessTree(process) {
   await new Promise((resolve) => {
     const killer = spawn("taskkill", ["/F", "/T", "/PID", String(process.pid)], { stdio: "ignore" });
@@ -549,7 +619,7 @@ try {
       control.sessionId,
       `chrome.storage.local.get(['meta', ${JSON.stringify(legacyKey)}]).then((got) => {
         const entry = got[${JSON.stringify(legacyKey)}];
-        return got.meta?.schemaVersion === 2 && entry?.kind === 'html' && entry?.later === false && entry?.laterAt === null
+        return got.meta?.schemaVersion === 3 && entry?.kind === 'html' && entry?.service === 'other' && entry?.later === false && entry?.laterAt === null
           ? { meta: got.meta, entry }
           : null;
       })`,
@@ -557,7 +627,7 @@ try {
     )
   );
   check(
-    "f. schema v1 migrates to v2",
+    "f. schema v1 migrates to v3",
     Boolean(migratedOnce),
     `schema=${migratedOnce?.meta?.schemaVersion} kind=${migratedOnce?.entry?.kind}`
   );
@@ -583,8 +653,9 @@ try {
   );
   check(
     "f. schema migration is idempotent",
-    migratedTwice?.meta?.schemaVersion === 2 &&
+    migratedTwice?.meta?.schemaVersion === 3 &&
       migratedTwice.entry?.kind === "html" &&
+      migratedTwice.entry?.service === "other" &&
       migratedTwice.entry?.later === false &&
       migratedTwice.entry?.laterAt === null &&
       countAfterSecondRun === countBeforeSecondRun,
@@ -959,8 +1030,378 @@ try {
     `before=${entryCountBeforeBookmarks} strip=${entryCountAfterStrip} folder=${entryCountAfterFolder}`
   );
 
+  await resetHubFixture(cdp, control.sessionId);
+  const classificationCases = [
+    ["r-sheet", "https://docs.google.com/spreadsheets/d/x", "web", "sheet"],
+    ["r-doc", "https://docs.google.com/document/d/x", "web", "doc"],
+    ["r-drive", "https://drive.google.com/drive/folders/x", "web", "drive"],
+    ["r-ai", "https://claude.ai/chat", "web", "ai"],
+    ["r-dev", "https://github.com/a/b", "web", "dev"],
+    ["r-not-dev", "https://notgithub.com/", "web", "other"],
+    ["r-gov", "https://www.mext.go.jp/a", "web", "gov"],
+    ["u-html", FILE_HTML, "html", "other"],
+    ["u-pdf", PDF_URL, "pdf", "other"]
+  ];
+  const migrationEntries = classificationCases.map(([id, url, kind]) => {
+    const entry = fixtureEntry({ id, url, kind });
+    delete entry.service;
+    return entry;
+  });
+  await evalIn(
+    cdp,
+    control.sessionId,
+    `chrome.storage.local.set({ meta: { schemaVersion: 2, backfillDoneAt: null }, ...${JSON.stringify(entryRecord(migrationEntries))} })`
+  );
+  hub = await openHub(cdp, control, extensionId);
+  const migratedV3 = await waitFor(() =>
+    evalIn(
+      cdp,
+      control.sessionId,
+      `chrome.storage.local.get(null).then((all) => {
+        const entries = Object.fromEntries(Object.entries(all).filter(([key]) => key.startsWith('entry:')).map(([, entry]) => [entry.id, entry]));
+        const index = all['index:newtab'] ?? [];
+        return all.meta?.schemaVersion === 3 && ${JSON.stringify(classificationCases.map(([id]) => id))}.every((id) => entries[id]?.service)
+          ? { meta: all.meta, entries, index }
+          : null;
+      })`,
+      1
+    )
+  );
+  const classificationActual = classificationCases.map(([id]) => migratedV3?.entries?.[id]?.service);
+  const classificationExpected = classificationCases.map(([, , , expected]) => expected);
+  check(
+    "r. service classification uses exact host boundaries",
+    JSON.stringify(classificationActual) === JSON.stringify(classificationExpected),
+    `actual=${JSON.stringify(classificationActual)}`
+  );
+  check(
+    "u. schema v2 migrates every entry and index to v3",
+    migratedV3?.meta?.schemaVersion === 3 &&
+      classificationCases.every(([id, , , expected]) => migratedV3.entries[id]?.service === expected) &&
+      migratedV3.index.every((entry) => typeof entry.service === "string"),
+    `schema=${migratedV3?.meta?.schemaVersion} entries=${Object.keys(migratedV3?.entries ?? {}).length} index=${migratedV3?.index?.length}`
+  );
+  const migrationSnapshot = JSON.stringify(migratedV3?.entries);
+  await closeHubTargets(cdp);
+  hub = await openHub(cdp, control, extensionId);
+  const migratedAgain = await evalIn(
+    cdp,
+    control.sessionId,
+    `chrome.storage.local.get(null).then((all) => Object.fromEntries(Object.entries(all).filter(([key]) => key.startsWith('entry:')).map(([, entry]) => [entry.id, entry])))`
+  );
+  check(
+    "u. schema v3 migration is idempotent",
+    JSON.stringify(migratedAgain) === migrationSnapshot,
+    `before=${Object.keys(migratedV3?.entries ?? {}).length} after=${Object.keys(migratedAgain ?? {}).length}`
+  );
+
+  await resetHubFixture(cdp, control.sessionId, { clearRules: true });
+  await evalIn(cdp, control.sessionId, "chrome.storage.local.set({ meta: { schemaVersion: 3, backfillDoneAt: null } })");
+  hub = await openHub(cdp, control, extensionId);
+  const seededRules = await waitFor(() =>
+    evalIn(
+      cdp,
+      control.sessionId,
+      "chrome.storage.local.get('serviceRules').then((got) => got.serviceRules?.rules?.length ? got.serviceRules : null)",
+      1
+    )
+  );
+  const customizedRules = structuredClone(seededRules);
+  customizedRules.version = 987;
+  const otherIndex = customizedRules.rules.findIndex((rule) => rule.id === "other");
+  customizedRules.rules.splice(otherIndex < 0 ? customizedRules.rules.length : otherIndex, 0, {
+    id: "custom-e2e",
+    label: "Custom E2E",
+    match: { host: ["custom-e2e.test"] },
+    color: "--svc-ai",
+    origin: "user",
+    hits: 0
+  });
+  await evalIn(
+    cdp,
+    control.sessionId,
+    `chrome.storage.local.set({ serviceRules: ${JSON.stringify(customizedRules)} })`
+  );
+  await closeHubTargets(cdp);
+  hub = await openHub(cdp, control, extensionId);
+  const preservedRules = await evalIn(
+    cdp,
+    control.sessionId,
+    "chrome.storage.local.get('serviceRules').then((got) => got.serviceRules)"
+  );
+  check(
+    "u2. existing service rules are never overwritten by the seed",
+    stableStringify(preservedRules) === stableStringify(customizedRules),
+    `version=${preservedRules?.version} rules=${preservedRules?.rules?.length}`
+  );
+
+  await resetHubFixture(cdp, control.sessionId, { closeTabs: true });
+  const promotionHost = "example-newsite.test";
+  const promotionEntries = Array.from({ length: 5 }, (_, index) =>
+    fixtureEntry({
+      id: `u3-${index + 1}`,
+      url: `https://${promotionHost}/item-${index + 1}`,
+      service: "other",
+      title: `promotion-${index + 1}`
+    })
+  );
+  await evalIn(
+    cdp,
+    control.sessionId,
+    `chrome.storage.local.set({ ...${JSON.stringify(entryRecord(promotionEntries.slice(0, 4)))}, 'index:newtab': ${JSON.stringify(promotionEntries.slice(0, 4))} })`
+  );
+  hub = await openHub(cdp, control, extensionId);
+  const rulesAtFour = await evalIn(
+    cdp,
+    control.sessionId,
+    `chrome.storage.local.get('serviceRules').then((got) => got.serviceRules.rules.filter((rule) => rule.origin === 'auto' && rule.match?.host?.includes(${JSON.stringify(promotionHost)})))`
+  );
+  check("u3. four unmatched entries do not auto-promote", rulesAtFour.length === 0, `auto=${rulesAtFour.length}`);
+
+  await closeHubTargets(cdp);
+  await evalIn(
+    cdp,
+    control.sessionId,
+    `chrome.storage.local.set({ ...${JSON.stringify(entryRecord([promotionEntries[4]]))}, 'index:newtab': ${JSON.stringify(promotionEntries)} })`
+  );
+  hub = await openHub(cdp, control, extensionId);
+  const promotedAtFive = await waitFor(() =>
+    evalIn(
+      cdp,
+      hub.sessionId,
+      `(async () => {
+        const got = await chrome.storage.local.get('serviceRules');
+        const rules = got.serviceRules.rules.filter((rule) => rule.origin === 'auto' && rule.match?.host?.includes(${JSON.stringify(promotionHost)}));
+        if (rules.length !== 1) return null;
+        const chip = [...document.querySelectorAll('[data-service-id]')].find((item) => item.dataset.serviceId === rules[0].id);
+        return chip ? { rules, chipCount: Number(chip.dataset.count) } : null;
+      })()`,
+      1
+    )
+  );
+  const promotionDiagnostic = await evalIn(
+    cdp,
+    control.sessionId,
+    `chrome.storage.local.get(null).then((all) => ({ entries: Object.values(all).filter((value) => value?.url?.startsWith('https://${promotionHost}/')).map((entry) => ({ id: entry.id, url: entry.url, kind: entry.kind, service: entry.service })), auto: all.serviceRules.rules.filter((rule) => rule.origin === 'auto') }))`
+  );
+  check(
+    "u3. fifth unmatched entry auto-promotes to an independent chip",
+    promotedAtFive?.rules?.length === 1 && promotedAtFive.chipCount === 5,
+    `auto=${promotedAtFive?.rules?.length ?? 0} chip=${promotedAtFive?.chipCount} stored=${promotionDiagnostic?.entries?.length}`
+  );
+
+  await resetHubFixture(cdp, control.sessionId);
+  const serviceEntries = [
+    ...Array.from({ length: 5 }, (_, index) => fixtureEntry({
+      id: `s-dev-${index}`,
+      url: `https://github.com/e2e/dev-${index}`,
+      service: "dev",
+      title: index < 3 ? `service-e2e-hit dev ${index}` : `dev ${index}`
+    })),
+    ...Array.from({ length: 3 }, (_, index) => fixtureEntry({
+      id: `s-ai-${index}`,
+      url: `https://claude.ai/chat/${index}`,
+      service: "ai",
+      title: index < 2 ? `service-e2e-hit ai ${index}` : `ai ${index}`
+    })),
+    ...Array.from({ length: 2 }, (_, index) => fixtureEntry({
+      id: `s-sheet-${index}`,
+      url: `https://docs.google.com/spreadsheets/d/e2e-${index}`,
+      service: "sheet",
+      title: index < 1 ? `service-e2e-hit sheet ${index}` : `sheet ${index}`
+    }))
+  ];
+  await evalIn(
+    cdp,
+    control.sessionId,
+    `chrome.storage.local.set({ ...${JSON.stringify(entryRecord(serviceEntries))}, 'index:newtab': ${JSON.stringify(serviceEntries)} })`
+  );
+  hub = await openHub(cdp, control, extensionId);
+  const initialChipOrder = await waitFor(() =>
+    evalIn(
+      cdp,
+      hub.sessionId,
+      `(() => {
+        const chips = [...document.querySelectorAll('[data-testid="service-chips"] .service-chip')].map((chip) => [chip.dataset.serviceId, Number(chip.dataset.count)]);
+        return chips.length === 3 ? chips : null;
+      })()`,
+      1
+    )
+  );
+  await evalIn(
+    cdp,
+    hub.sessionId,
+    `(() => {
+      const input = document.querySelector('[data-testid="hub-search"]');
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+      setter.call(input, 'service-e2e-hit');
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    })()`
+  );
+  const searchedChipOrder = await waitFor(() =>
+    evalIn(
+      cdp,
+      hub.sessionId,
+      `(() => {
+        const chips = [...document.querySelectorAll('[data-testid="service-chips"] .service-chip')].map((chip) => [chip.dataset.serviceId, Number(chip.dataset.count)]);
+        return JSON.stringify(chips) === JSON.stringify([['dev',3],['ai',2],['sheet',1]]) ? chips : null;
+      })()`,
+      1
+    )
+  );
+  await evalIn(cdp, hub.sessionId, "document.querySelector('[data-testid=\"service-chip-dev\"]').click()", 1);
+  const devFiltered = await waitFor(() =>
+    evalIn(
+      cdp,
+      hub.sessionId,
+      `(() => {
+        const rows = [...document.querySelectorAll('[data-entry-id]')];
+        return rows.length === 3 && rows.every((row) => row.dataset.kind === 'web' && row.dataset.serviceId === 'dev') ? rows.length : null;
+      })()`,
+      1
+    )
+  );
+  await evalIn(cdp, hub.sessionId, "document.querySelector('[data-testid=\"service-chip-ai\"]').click()", 1);
+  const orFiltered = await waitFor(() =>
+    evalIn(cdp, hub.sessionId, "document.querySelectorAll('[data-entry-id]').length === 5 ? 5 : null", 1)
+  );
+  check(
+    "s. service chips sort, recount, AND-filter, and OR within the service axis",
+    JSON.stringify(initialChipOrder) === JSON.stringify([["dev", 5], ["ai", 3], ["sheet", 2]]) &&
+      JSON.stringify(searchedChipOrder) === JSON.stringify([["dev", 3], ["ai", 2], ["sheet", 1]]) &&
+      devFiltered === 3 && orFiltered === 5,
+    `initial=${JSON.stringify(initialChipOrder)} search=${JSON.stringify(searchedChipOrder)} dev=${devFiltered} or=${orFiltered}`
+  );
+
+  await evalIn(cdp, hub.sessionId, "document.querySelector('[data-testid=\"kind-tab-html\"]').click()", 1);
+  const serviceStripGone = await waitFor(() =>
+    evalIn(cdp, hub.sessionId, "!document.querySelector('[data-testid=\"service-chips\"]')", 1)
+  );
+  check("t. html-only kind filter removes the service chip row from DOM", Boolean(serviceStripGone));
+
+  await resetHubFixture(cdp, control.sessionId);
+  const groupCloseUrls = [
+    `https://example.com/v-group-a-${Date.now()}`,
+    `https://example.com/v-group-b-${Date.now()}`
+  ];
+  const groupCloseTabIds = [];
+  for (const url of groupCloseUrls) groupCloseTabIds.push(await openTab(cdp, control.sessionId, url));
+  const groupCloseEntries = [];
+  for (const url of groupCloseUrls) {
+    groupCloseEntries.push(await waitForEntry(cdp, control.sessionId, url));
+  }
+  hub = await openHub(cdp, control, extensionId);
+  const faviconState = await waitFor(() =>
+    evalIn(
+      cdp,
+      hub.sessionId,
+      `(() => {
+        const row = document.querySelector('[data-entry-id=${JSON.stringify(groupCloseEntries[0]?.entry.id)}]');
+        const img = row?.querySelector('img.favicon');
+        if (!img) return null;
+        const src = new URL(img.src);
+        const size = getComputedStyle(img);
+        return { protocol: src.protocol, host: src.host, path: src.pathname, pageUrl: src.searchParams.get('pageUrl'), requestedSize: src.searchParams.get('size'), width: size.width, height: size.height };
+      })()`,
+      1
+    )
+  );
+  check(
+    "w. web favicon uses the extension _favicon API at size 32 and renders at 15px",
+    faviconState?.protocol === "chrome-extension:" &&
+      faviconState.host === extensionId &&
+      faviconState.path === "/_favicon/" &&
+      faviconState.pageUrl === groupCloseUrls[0] &&
+      faviconState.requestedSize === "32" &&
+      faviconState.width === "15px" &&
+      faviconState.height === "15px",
+    JSON.stringify(faviconState)
+  );
+  const undoBeforeGroupClose = await evalIn(
+    cdp,
+    control.sessionId,
+    "chrome.storage.local.get('undo:lastClosed').then((got) => got['undo:lastClosed']?.ts ?? 0)"
+  );
+  await evalIn(
+    cdp,
+    hub.sessionId,
+    `(() => {
+      const row = document.querySelector('[data-entry-id=${JSON.stringify(groupCloseEntries[0]?.entry.id)}]');
+      const group = row?.closest('.hub-group');
+      const peer = group?.querySelector('[data-entry-id=${JSON.stringify(groupCloseEntries[1]?.entry.id)}]');
+      if (!group || !peer) throw new Error('group-close fixture rows are not in one group');
+      group.querySelector('.group-close-action').click();
+    })()`
+  );
+  const groupClosed = await waitFor(() =>
+    evalIn(
+      cdp,
+      control.sessionId,
+      `(async () => {
+        const gone = await Promise.all(${JSON.stringify(groupCloseTabIds)}.map((id) => chrome.tabs.get(id).then(() => false).catch(() => true)));
+        const undo = (await chrome.storage.local.get('undo:lastClosed'))['undo:lastClosed'];
+        return gone.every(Boolean) && undo?.ts > ${undoBeforeGroupClose} && undo.urls?.length === 2
+          ? { urls: [...undo.urls].sort(), ts: undo.ts }
+          : null;
+      })()`,
+      1
+    )
+  );
+  check(
+    "v. group close removes every tab after saving an undo snapshot",
+    JSON.stringify(groupClosed?.urls) === JSON.stringify([...groupCloseUrls].sort()),
+    JSON.stringify(groupClosed)
+  );
+
+  await resetHubFixture(cdp, control.sessionId);
+  const densityAt = Date.now();
+  const densityEntries = Array.from({ length: 140 }, (_, index) =>
+    fixtureEntry({
+      id: `q-density-${String(index).padStart(3, "0")}`,
+      url: `file:///C:/e2e/density/group-${String(Math.floor(index / 7)).padStart(2, "0")}/item-${index}.html`,
+      kind: "html",
+      service: "other",
+      group: `density-group-${String(Math.floor(index / 7)).padStart(2, "0")}`,
+      title: `density item ${index}`,
+      at: densityAt - index
+    })
+  );
+  await evalIn(
+    cdp,
+    control.sessionId,
+    `chrome.storage.local.set({ ...${JSON.stringify(entryRecord(densityEntries))}, 'index:newtab': ${JSON.stringify(densityEntries)} })`
+  );
+  hub = await openHub(cdp, control, extensionId);
+  await cdp.send(
+    "Emulation.setDeviceMetricsOverride",
+    { width: 1680, height: 1000, deviceScaleFactor: 1, mobile: false },
+    hub.sessionId
+  );
+  const densityState = await waitFor(() =>
+    evalIn(
+      cdp,
+      hub.sessionId,
+      `(() => {
+        const fixtureIds = new Set(${JSON.stringify(densityEntries.map((entry) => entry.id))});
+        const rows = [...document.querySelectorAll('[data-entry-id]')].filter((row) => fixtureIds.has(row.dataset.entryId));
+        if (rows.length !== 140) return null;
+        const within = rows.filter((row) => {
+          const rect = row.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0 && rect.top >= 0 && rect.left >= 0 && rect.bottom <= innerHeight && rect.right <= innerWidth;
+        }).length;
+        return { innerWidth, innerHeight, total: rows.length, within, groups: document.querySelectorAll('[data-testid="band-recent"] .hub-group').length };
+      })()`,
+      1
+    )
+  );
+  check(
+    "q. dense layout keeps at least 100 of 140 rows inside a 1680x1000 viewport",
+    densityState?.innerWidth === 1680 && densityState?.innerHeight === 1000 && densityState.within >= 100 && densityState.groups === 20,
+    JSON.stringify(densityState)
+  );
+
   if (openedBookmarkTabs?.length) {
-    await evalIn(cdp, control.sessionId, `chrome.tabs.remove(${JSON.stringify(openedBookmarkTabs)})`);
+    await evalIn(cdp, control.sessionId, `chrome.tabs.remove(${JSON.stringify(openedBookmarkTabs)}).catch(() => undefined)`);
   }
 
   console.log(JSON.stringify({ ok: results.every((result) => result.ok), extensionId, results }, null, 2));

@@ -3,20 +3,34 @@ import type {
   Meta,
   NewTabIndexEntry,
   ReportEntry,
+  ServiceRulesStore,
   Settings,
   TabSet
 } from "./types";
 import { DEFAULT_SETTINGS } from "./types";
-import { entryIdFromKey, fileName, inferGroup, normalizeTarget } from "./url";
+import {
+  autoServiceColor,
+  autoServiceId,
+  autoServiceLabel,
+  entryIdFromKey,
+  fileName,
+  inferGroup,
+  inferService,
+  matchServiceRule,
+  normalizeTarget,
+  SEED_SERVICE_RULES,
+  serviceHostname
+} from "./url";
 
 const ENTRY_PREFIX = "entry:";
 const SETTINGS_KEY = "settings";
 const META_KEY = "meta";
+export const SERVICE_RULES_KEY = "serviceRules";
 /** Above this, oldest archived non-pinned entries are pruned. */
 const ENTRY_CAP = 10000;
 
 interface LegacyMeta {
-  schemaVersion: 1;
+  schemaVersion: 1 | 2;
   backfillDoneAt: number | null;
 }
 
@@ -51,16 +65,16 @@ export async function getMeta(): Promise<StoredMeta> {
 export async function patchMeta(patch: Partial<Meta>): Promise<void> {
   const meta = await getMeta();
   await chrome.storage.local.set({
-    [META_KEY]: { ...meta, schemaVersion: 2, ...patch }
+    [META_KEY]: { ...meta, schemaVersion: 3, ...patch }
   });
 }
 
 let migrationPromise: Promise<void> | null = null;
 
-/** Upgrade legacy file-only entries in one idempotent storage write. */
-export function ensureSchemaV2(): Promise<void> {
+/** Upgrade legacy entries and initialize the storage-backed service rule seed. */
+export function ensureSchemaV3(): Promise<void> {
   if (!migrationPromise) {
-    migrationPromise = migrateSchemaV2().catch((error) => {
+    migrationPromise = migrateSchemaV3().catch((error) => {
       migrationPromise = null;
       throw error;
     });
@@ -68,13 +82,17 @@ export function ensureSchemaV2(): Promise<void> {
   return migrationPromise;
 }
 
-async function migrateSchemaV2(): Promise<void> {
-  const metaGot = await chrome.storage.local.get(META_KEY);
+async function migrateSchemaV3(): Promise<void> {
+  const metaGot = await chrome.storage.local.get([META_KEY, SERVICE_RULES_KEY]);
   const meta = (metaGot[META_KEY] as StoredMeta | undefined) ?? {
     schemaVersion: 1,
     backfillDoneAt: null
   };
-  if (meta.schemaVersion === 2) return;
+  const hasStoredRules = Object.prototype.hasOwnProperty.call(metaGot, SERVICE_RULES_KEY);
+  const serviceRules = hasStoredRules
+    ? (metaGot[SERVICE_RULES_KEY] as ServiceRulesStore)
+    : structuredClone(SEED_SERVICE_RULES);
+  if (meta.schemaVersion === 3 && hasStoredRules) return;
 
   const all = await chrome.storage.local.get(null);
   const migrated: ReportEntry[] = [];
@@ -83,12 +101,14 @@ async function migrateSchemaV2(): Promise<void> {
     if (!isEntryStorageKey(key)) continue;
     const raw = value as Partial<ReportEntry>;
     const later = raw.later === true;
+    const kind =
+      raw.kind === "web" || raw.kind === "pdf" || raw.kind === "html"
+        ? raw.kind
+        : "html";
     const entry = {
       ...raw,
-      kind:
-        raw.kind === "web" || raw.kind === "pdf" || raw.kind === "html"
-          ? raw.kind
-          : "html",
+      kind,
+      service: inferService(raw.url ?? "", kind, serviceRules.rules),
       later,
       laterAt: later && typeof raw.laterAt === "number" ? raw.laterAt : null
     } as ReportEntry;
@@ -97,8 +117,53 @@ async function migrateSchemaV2(): Promise<void> {
   }
   record[PANEL_INDEX_KEY] = trimPanelIndex(migrated);
   record[NEW_TAB_INDEX_KEY] = trimNewTabIndex(migrated);
-  record[META_KEY] = { schemaVersion: 2, backfillDoneAt: meta.backfillDoneAt } satisfies Meta;
+  record[META_KEY] = { schemaVersion: 3, backfillDoneAt: meta.backfillDoneAt } satisfies Meta;
+  if (!hasStoredRules) record[SERVICE_RULES_KEY] = serviceRules;
   await chrome.storage.local.set(record);
+}
+
+export async function getServiceRules(): Promise<ServiceRulesStore> {
+  const got = await chrome.storage.local.get(SERVICE_RULES_KEY);
+  if (Object.prototype.hasOwnProperty.call(got, SERVICE_RULES_KEY)) {
+    return got[SERVICE_RULES_KEY] as ServiceRulesStore;
+  }
+  const seed = structuredClone(SEED_SERVICE_RULES);
+  await chrome.storage.local.set({ [SERVICE_RULES_KEY]: seed });
+  return seed;
+}
+
+/** Promote currently-unmatched hosts once per hub opening. Existing rules are never replaced. */
+export async function promoteServiceRules(entries: ReportEntry[]): Promise<ServiceRulesStore> {
+  const current = await getServiceRules();
+  const counts = new Map<string, number>();
+  for (const entry of entries) {
+    if (entry.kind !== "web") continue;
+    if (matchServiceRule(entry.url, current.rules)?.id !== "other") continue;
+    const host = serviceHostname(entry.url);
+    if (host) counts.set(host, (counts.get(host) ?? 0) + 1);
+  }
+
+  const rules = [...current.rules];
+  let changed = false;
+  for (const [host, count] of [...counts].sort(([left], [right]) => left.localeCompare(right))) {
+    if (count < 5 || matchServiceRule(`https://${host}/`, rules)?.id !== "other") continue;
+    const rule = {
+      id: autoServiceId(host),
+      label: autoServiceLabel(host),
+      match: { host: [host] },
+      color: autoServiceColor(host, rules),
+      origin: "auto" as const,
+      hits: 0
+    };
+    const fallbackIndex = rules.findIndex((item) => item.id === "other");
+    if (fallbackIndex >= 0) rules.splice(fallbackIndex, 0, rule);
+    else rules.push(rule);
+    changed = true;
+  }
+  if (!changed) return current;
+  const next = { ...current, rules };
+  await chrome.storage.local.set({ [SERVICE_RULES_KEY]: next });
+  return next;
 }
 
 export async function getAllEntries(): Promise<ReportEntry[]> {
@@ -254,6 +319,7 @@ function toNewTabIndexEntry(entry: ReportEntry): NewTabIndexEntry {
     pinned,
     archived,
     kind,
+    service,
     later,
     laterAt
   } = entry;
@@ -269,6 +335,7 @@ function toNewTabIndexEntry(entry: ReportEntry): NewTabIndexEntry {
     pinned,
     archived,
     kind,
+    service,
     later,
     laterAt
   };
@@ -301,6 +368,7 @@ export interface VisitInput {
   path: string;
   key: string;
   kind?: ReportEntry["kind"];
+  service?: ReportEntry["service"];
   title?: string;
   at: number;
   source: ReportEntry["source"];
@@ -314,6 +382,7 @@ export interface VisitInput {
 
 export async function upsertVisit(v: VisitInput, settings: Settings): Promise<ReportEntry> {
   const kind = v.kind ?? normalizeTarget(v.url, settings)?.kind ?? "html";
+  const service = v.service ?? inferService(v.url, kind, (await getServiceRules()).rules);
   const id = await entryIdFromKey(v.key);
   const cur = await getEntry(id);
   if (cur) {
@@ -323,6 +392,7 @@ export async function upsertVisit(v: VisitInput, settings: Settings): Promise<Re
       path: v.path,
       key: v.key,
       kind,
+      service,
       title: v.title && v.title.trim() ? v.title : cur.title,
       firstSeenAt: Math.min(cur.firstSeenAt, v.firstSeenAt ?? v.at),
       lastSeenAt: Math.max(cur.lastSeenAt, v.at),
@@ -354,6 +424,7 @@ export async function upsertVisit(v: VisitInput, settings: Settings): Promise<Re
     missingCheckedAt: v.source === "live" ? v.at : null,
     source: v.source,
     kind,
+    service,
     later: false,
     laterAt: null
   };
@@ -428,6 +499,7 @@ export async function importData(
     await saveSettings({ ...DEFAULT_SETTINGS, ...file.settings });
   }
   const settings = await getSettings();
+  const serviceRules = await getServiceRules();
   let merged = 0;
   for (const raw of file.entries) {
     if (!raw?.key || !raw?.path) continue;
@@ -440,6 +512,11 @@ export async function importData(
         raw.kind === "web" || raw.kind === "pdf" || raw.kind === "html"
           ? raw.kind
           : "html",
+      service: inferService(
+        raw.url,
+        raw.kind === "web" || raw.kind === "pdf" || raw.kind === "html" ? raw.kind : "html",
+        serviceRules.rules
+      ),
       later: raw.later === true,
       laterAt: raw.later === true && typeof raw.laterAt === "number" ? raw.laterAt : null,
       group: inferGroup(raw.path, settings.groupRules)

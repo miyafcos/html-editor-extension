@@ -7,8 +7,9 @@
 import type { Msg, MsgResponse } from "../reporthub/messages";
 import {
   enforceEntryCap,
-  ensureSchemaV2,
+  ensureSchemaV3,
   getMeta,
+  getServiceRules,
   getSettings,
   patchEntryByKey,
   patchMeta,
@@ -30,7 +31,7 @@ import {
   toggleCollapse,
   undoLastClose
 } from "../reporthub/tabops";
-import { isTargetFile, normalizeFileUrl, normalizeTarget } from "../reporthub/url";
+import { inferService, isTargetFile, normalizeFileUrl, normalizeTarget } from "../reporthub/url";
 
 type HubTabstripMsg = { type: "collapse-hub-tabs" } | { type: "expand-hub-tabs" };
 type ReportHubMsg = Msg | HubTabstripMsg;
@@ -95,7 +96,7 @@ async function migrateTabSessionKeys(addedTabId: number, removedTabId: number): 
 }
 
 export function initReportHub(): void {
-  schemaReady = ensureSchemaV2();
+  schemaReady = ensureSchemaV3();
   void chrome.action.setBadgeBackgroundColor({ color: "#2563eb" });
   void updateBadge();
   void ensureAutoDiscardAlarm();
@@ -315,6 +316,8 @@ async function handleTabCompleted(tabId: number, tab: chrome.tabs.Tab): Promise<
   const settings = await getSettings();
   const norm = normalizeTarget(tab.url, settings);
   if (!norm) return;
+  const serviceRules = await getServiceRules();
+  const service = inferService(norm.url, norm.kind, serviceRules.rules);
   await replacementMigrations.get(tabId);
   const sess = await chrome.storage.session.get([
     visitKey(tabId),
@@ -338,6 +341,7 @@ async function handleTabCompleted(tabId: number, tab: chrome.tabs.Tab): Promise<
       path: norm.path,
       key: norm.key,
       kind: norm.kind,
+      service,
       title: tab.title,
       at: Date.now(),
       source: "live",
@@ -374,6 +378,7 @@ async function backfillFromHistory(): Promise<number> {
         path: norm.path,
         key: norm.key,
         kind: "html",
+        service: "other",
         title: item.title,
         at: lastVisit,
         source: "backfill",

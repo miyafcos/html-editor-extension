@@ -1,13 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   NEW_TAB_INDEX_KEY,
-  ensureSchemaV2,
+  SERVICE_RULES_KEY,
+  ensureSchemaV3,
   getAllEntries,
   getEntry,
   getNewTabIndex,
   getSettings,
   patchEntry,
   putEntry,
+  promoteServiceRules,
   rebuildNewTabIndex,
   removeEntries
 } from "../reporthub/repo";
@@ -16,10 +18,21 @@ import {
   FALLBACK_GROUP,
   type NewTabIndexEntry,
   type ReportEntry,
+  type ServiceRule,
+  type ServiceRulesStore,
   type Settings,
   type UndoSnapshot
 } from "../reporthub/types";
-import { entryIdFromKey, fileName, inferGroup, normalizeTarget, parentDir } from "../reporthub/url";
+import {
+  entryIdFromKey,
+  fileName,
+  hostDisplayName,
+  inferGroup,
+  inferService,
+  matchServiceRule,
+  normalizeTarget,
+  serviceHostname
+} from "../reporthub/url";
 import { S } from "./strings";
 
 type Kind = ReportEntry["kind"];
@@ -31,7 +44,6 @@ interface HubEntry extends NewTabIndexEntry {
   tabId?: number;
   windowId?: number;
   chromePinned?: boolean;
-  faviconUrl?: string;
 }
 
 interface ToastState {
@@ -49,10 +61,11 @@ const LAYOUT_STORAGE_KEY = "tabhub:layout";
 interface LayoutState {
   kind: KindFilter;
   collapsedBands: CollapsibleBand[];
+  selectedServices: string[];
 }
 
 function readLayoutState(): LayoutState {
-  const fallback: LayoutState = { kind: "all", collapsedBands: [] };
+  const fallback: LayoutState = { kind: "all", collapsedBands: [], selectedServices: [] };
   try {
     const stored = JSON.parse(localStorage.getItem(LAYOUT_STORAGE_KEY) ?? "null") as Partial<LayoutState> | null;
     if (!stored || !KIND_FILTERS.includes(stored.kind as KindFilter)) return fallback;
@@ -61,7 +74,10 @@ function readLayoutState(): LayoutState {
           COLLAPSIBLE_BANDS.includes(band as CollapsibleBand)
         )
       : [];
-    return { kind: stored.kind as KindFilter, collapsedBands: [...new Set(collapsedBands)] };
+    const selectedServices = Array.isArray(stored.selectedServices)
+      ? [...new Set(stored.selectedServices.filter((id): id is string => typeof id === "string"))]
+      : [];
+    return { kind: stored.kind as KindFilter, collapsedBands: [...new Set(collapsedBands)], selectedServices };
   } catch {
     return fallback;
   }
@@ -80,6 +96,7 @@ function compact(entry: ReportEntry): NewTabIndexEntry {
     pinned,
     archived,
     kind,
+    service,
     later,
     laterAt
   } = entry;
@@ -95,6 +112,7 @@ function compact(entry: ReportEntry): NewTabIndexEntry {
     pinned,
     archived,
     kind,
+    service,
     later,
     laterAt
   };
@@ -106,23 +124,21 @@ function searchText(entry: HubEntry): string {
     .normalize("NFC");
 }
 
-function locationLabel(entry: HubEntry): string {
-  if (entry.url.startsWith("file:")) return parentDir(entry.path);
-  try {
-    return new URL(entry.url).host;
-  } catch {
-    return entry.path;
-  }
-}
-
-function kindIcon(kind: Kind): string {
-  if (kind === "html") return "🧾";
-  if (kind === "pdf") return "📑";
-  return "📄";
-}
-
 function faviconUrl(url: string): string {
   return chrome.runtime.getURL(`/_favicon/?pageUrl=${encodeURIComponent(url)}&size=32`);
+}
+
+function ruleColorStyle(rule: ServiceRule | null): React.CSSProperties {
+  return { backgroundColor: `var(${rule?.color ?? "--svc-other"})` };
+}
+
+function Favicon({ url, rule }: { url: string; rule: ServiceRule | null }) {
+  const [failed, setFailed] = useState(false);
+  useEffect(() => setFailed(false), [url]);
+  if (url.startsWith("file:") || failed) {
+    return <span className="favicon favicon-fallback" style={ruleColorStyle(rule)} aria-hidden="true" />;
+  }
+  return <img className="favicon" src={faviconUrl(url)} alt="" onError={() => setFailed(true)} />;
 }
 
 function bookmarkBarChildren(tree: chrome.bookmarks.BookmarkTreeNode[]): chrome.bookmarks.BookmarkTreeNode[] {
@@ -141,10 +157,12 @@ function bookmarkSearchText(node: chrome.bookmarks.BookmarkTreeNode): string {
 
 function BookmarkStrip({
   nodes,
-  onOpen
+  onOpen,
+  getRule
 }: {
   nodes: chrome.bookmarks.BookmarkTreeNode[];
   onOpen: (url: string) => void;
+  getRule: (url: string) => ServiceRule | null;
 }) {
   const [openPath, setOpenPath] = useState<chrome.bookmarks.BookmarkTreeNode[]>([]);
   const [menuLeft, setMenuLeft] = useState(0);
@@ -193,7 +211,7 @@ function BookmarkStrip({
 
   return (
     <section className="bookmark-strip" data-testid="bookmark-strip" ref={stripRef}>
-      <h2><span aria-hidden="true">⭐</span> {S.bookmarks.lead}</h2>
+      <h2 aria-label={S.bookmarks.lead} title={S.bookmarks.lead}><span aria-hidden="true">⭐</span></h2>
       <div className="bookmark-chips" data-testid="bookmark-chips">
         {nodes.length ? (
           nodes.map((node) =>
@@ -207,6 +225,7 @@ function BookmarkStrip({
                 title={node.title || node.url}
                 onClick={() => onOpen(node.url!)}
               >
+                <Favicon url={node.url} rule={getRule(node.url)} />
                 <span>{node.title || node.url}</span>
               </button>
             ) : (
@@ -291,7 +310,15 @@ function BookmarkStrip({
   );
 }
 
-function BookmarkResult({ node, onOpen }: { node: chrome.bookmarks.BookmarkTreeNode; onOpen: (url: string) => void }) {
+function BookmarkResult({
+  node,
+  onOpen,
+  getRule
+}: {
+  node: chrome.bookmarks.BookmarkTreeNode;
+  onOpen: (url: string) => void;
+  getRule: (url: string) => ServiceRule | null;
+}) {
   const url = node.url!;
   return (
     <button
@@ -299,13 +326,12 @@ function BookmarkResult({ node, onOpen }: { node: chrome.bookmarks.BookmarkTreeN
       className="bookmark-result"
       data-testid={`bookmark-search-${node.id}`}
       data-bookmark-id={node.id}
+      title={`${node.title || url}\n${url}`}
       onClick={() => onOpen(url)}
     >
       <span className="bookmark-result-mark" aria-hidden="true">⭐</span>
-      <span className="bookmark-result-copy">
-        <strong>{node.title || url}</strong>
-        <small>{url}</small>
-      </span>
+      <Favicon url={url} rule={getRule(url)} />
+      <span className="bookmark-result-copy">{node.title || url}</span>
     </button>
   );
 }
@@ -313,33 +339,29 @@ function BookmarkResult({ node, onOpen }: { node: chrome.bookmarks.BookmarkTreeN
 function AppRow({
   entry,
   band,
+  serviceRule,
   onOpen,
   onLater,
-  onPin,
-  onRemove,
-  showKindIcon
+  onClose
 }: {
   entry: HubEntry;
   band: Band;
+  serviceRule: ServiceRule | null;
   onOpen: (entry: HubEntry, band: Band) => void;
   onLater: (entry: HubEntry) => void;
-  onPin: (entry: HubEntry) => void;
-  onRemove: (entry: HubEntry) => void;
-  showKindIcon: boolean;
+  onClose: (entry: HubEntry, band: Band) => void;
 }) {
-  const isPinned = entry.pinned || entry.chromePinned;
   const openLabel = band === "open" ? S.action.switchTo : S.action.openNew;
-  const location = locationLabel(entry);
-  const secondary = entry.group === FALLBACK_GROUP ? location : `${entry.group} · ${location}`;
   return (
     <article
-      className={`hub-row${showKindIcon ? " show-kind-icon" : ""}`}
+      className="hub-row"
       data-testid={`row-${band}-${entry.id}`}
       data-entry-id={entry.id}
       data-kind={entry.kind}
+      data-service-id={serviceRule?.id ?? "other"}
       role="button"
       tabIndex={0}
-      title={openLabel}
+      title={`${entry.title || fileName(entry.path)}\n${entry.url}`}
       aria-label={`${openLabel}: ${entry.title}`}
       onClick={() => onOpen(entry, band)}
       onKeyDown={(event) => {
@@ -349,20 +371,8 @@ function AppRow({
         }
       }}
     >
-      <span className={`kind-mark kind-mark-${entry.kind}`} aria-hidden="true" />
-      {showKindIcon && <span className="kind-icon" aria-hidden="true">{kindIcon(entry.kind)}</span>}
-      <img
-        className="favicon"
-        src={entry.faviconUrl || faviconUrl(entry.url)}
-        alt=""
-        onError={(event) => {
-          event.currentTarget.hidden = true;
-        }}
-      />
-      <span className="row-copy">
-        <strong>{entry.title || fileName(entry.path)}</strong>
-        <small>{secondary}</small>
-      </span>
+      <Favicon url={entry.url} rule={serviceRule} />
+      <span className="row-copy">{entry.title || fileName(entry.path)}</span>
       <span className="row-actions">
         {band === "open" && (
           <button
@@ -380,25 +390,12 @@ function AppRow({
         )}
         <button
           type="button"
-          data-testid={`pin-${entry.id}`}
-          className={isPinned ? "is-active" : undefined}
-          title={isPinned ? S.action.unpin : S.action.pin}
-          aria-label={isPinned ? S.action.unpin : S.action.pin}
-          onClick={(event) => {
-            event.stopPropagation();
-            onPin(entry);
-          }}
-        >
-          📌
-        </button>
-        <button
-          type="button"
           data-testid={`remove-${entry.id}`}
           title={S.action.remove}
           aria-label={S.action.remove}
           onClick={(event) => {
             event.stopPropagation();
-            onRemove(entry);
+            onClose(entry, band);
           }}
         >
           ×
@@ -408,15 +405,24 @@ function AppRow({
   );
 }
 
+interface HubGroup {
+  key: string;
+  name: string;
+  kind: Kind;
+  entries: HubEntry[];
+}
+
 export function App() {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [index, setIndex] = useState<NewTabIndexEntry[]>([]);
   const [openTabs, setOpenTabs] = useState<HubEntry[]>([]);
   const [fullEntries, setFullEntries] = useState<NewTabIndexEntry[] | null>(null);
   const [bookmarkNodes, setBookmarkNodes] = useState<chrome.bookmarks.BookmarkTreeNode[]>([]);
+  const [serviceRules, setServiceRules] = useState<ServiceRulesStore | null>(null);
   const [query, setQuery] = useState("");
   const [toast, setToast] = useState<ToastState | null>(null);
   const [layout, setLayout] = useState<LayoutState>(readLayoutState);
+  const [collapsedGroups, setCollapsedGroups] = useState<string[]>([]);
   const [tabstripBusy, setTabstripBusy] = useState(false);
   const fullLoadRef = useRef<Promise<NewTabIndexEntry[]> | null>(null);
 
@@ -444,7 +450,7 @@ export function App() {
     setBookmarkNodes(bookmarkBarChildren(tree));
   }, []);
 
-  const loadTabs = useCallback(async (currentSettings: Settings) => {
+  const loadTabs = useCallback(async (currentSettings: Settings, rules: ServiceRule[]) => {
     const tabs = await chrome.tabs.query({});
     const next: HubEntry[] = [];
     for (const tab of tabs) {
@@ -463,12 +469,12 @@ export function App() {
         pinned: false,
         archived: false,
         kind: norm.kind,
+        service: inferService(norm.url, norm.kind, rules),
         later: false,
         laterAt: null,
         tabId: tab.id,
         windowId: tab.windowId,
-        chromePinned: tab.pinned,
-        faviconUrl: tab.favIconUrl
+        chromePinned: tab.pinned
       });
     }
     setOpenTabs(next);
@@ -477,10 +483,12 @@ export function App() {
   useEffect(() => {
     document.title = S.documentTitle;
     void (async () => {
-      await ensureSchemaV2();
-      const currentSettings = await getSettings();
+      await ensureSchemaV3();
+      const [currentSettings, entries] = await Promise.all([getSettings(), getAllEntries()]);
+      const currentRules = await promoteServiceRules(entries);
       setSettings(currentSettings);
-      await Promise.all([loadIndex(), loadTabs(currentSettings), loadBookmarks()]);
+      setServiceRules(currentRules);
+      await Promise.all([loadIndex(), loadTabs(currentSettings, currentRules.rules), loadBookmarks()]);
     })();
   }, [loadBookmarks, loadIndex, loadTabs]);
 
@@ -491,8 +499,13 @@ export function App() {
         setFullEntries(null);
         void loadIndex();
       }
+      if (area === "local" && changes[SERVICE_RULES_KEY]?.newValue) {
+        setServiceRules(changes[SERVICE_RULES_KEY].newValue as ServiceRulesStore);
+      }
     };
-    const tabHandler = () => void loadTabs(settings);
+    const tabHandler = () => {
+      if (serviceRules) void loadTabs(settings, serviceRules.rules);
+    };
     chrome.storage.onChanged.addListener(storageHandler);
     chrome.tabs.onCreated.addListener(tabHandler);
     chrome.tabs.onRemoved.addListener(tabHandler);
@@ -503,7 +516,7 @@ export function App() {
       chrome.tabs.onRemoved.removeListener(tabHandler);
       chrome.tabs.onUpdated.removeListener(tabHandler);
     };
-  }, [loadIndex, loadTabs, settings]);
+  }, [loadIndex, loadTabs, serviceRules, settings]);
 
   useEffect(() => {
     const refreshBookmarks = () => void loadBookmarks();
@@ -542,8 +555,7 @@ export function App() {
               title: tab.title || stored.title,
               tabId: tab.tabId,
               windowId: tab.windowId,
-              chromePinned: tab.chromePinned,
-              faviconUrl: tab.faviconUrl
+              chromePinned: tab.chromePinned
             }
           : tab
       );
@@ -585,13 +597,49 @@ export function App() {
     [visibleEntries]
   );
 
-  const filteredEntries = useMemo(
+  const fallbackServiceRule = useMemo(
+    () => serviceRules?.rules.find((rule) => rule.id === "other") ?? null,
+    [serviceRules]
+  );
+  const getRuleForUrl = useCallback(
+    (url: string) => matchServiceRule(url, serviceRules?.rules ?? []) ?? fallbackServiceRule,
+    [fallbackServiceRule, serviceRules]
+  );
+  const getRuleForEntry = useCallback(
+    (entry: HubEntry) => entry.kind === "web" ? getRuleForUrl(entry.url) : fallbackServiceRule,
+    [fallbackServiceRule, getRuleForUrl]
+  );
+
+  const kindFilteredEntries = useMemo(
     () =>
       layout.kind === "all"
         ? visibleEntries
         : visibleEntries.filter((entry) => entry.kind === layout.kind),
     [layout.kind, visibleEntries]
   );
+
+  const serviceChips = useMemo(() => {
+    if (!serviceRules) return [];
+    const counts = new Map<string, number>();
+    for (const entry of kindFilteredEntries) {
+      if (entry.kind !== "web") continue;
+      const id = getRuleForEntry(entry)?.id ?? "other";
+      counts.set(id, (counts.get(id) ?? 0) + 1);
+    }
+    const order = new Map(serviceRules.rules.map((rule, index) => [rule.id, index]));
+    return serviceRules.rules
+      .filter((rule) => (counts.get(rule.id) ?? 0) > 0)
+      .map((rule) => ({ rule, count: counts.get(rule.id) ?? 0 }))
+      .sort((left, right) => right.count - left.count || (order.get(left.rule.id) ?? 0) - (order.get(right.rule.id) ?? 0));
+  }, [getRuleForEntry, kindFilteredEntries, serviceRules]);
+
+  const filteredEntries = useMemo(() => {
+    const selected = new Set(layout.selectedServices);
+    if (!selected.size || layout.kind === "html" || layout.kind === "pdf") return kindFilteredEntries;
+    return kindFilteredEntries.filter(
+      (entry) => entry.kind === "web" && selected.has(getRuleForEntry(entry)?.id ?? "other")
+    );
+  }, [getRuleForEntry, kindFilteredEntries, layout.kind, layout.selectedServices]);
 
   const rowsByBand = useMemo(
     () => ({
@@ -651,23 +699,24 @@ export function App() {
     [ensureStored]
   );
 
-  const togglePin = useCallback(
-    async (entry: HubEntry) => {
-      const stored = await ensureStored(entry);
-      if (entry.chromePinned && entry.tabId != null) {
-        await chrome.tabs.update(entry.tabId, { pinned: false });
-        if (stored.pinned) await patchEntry(entry.id, { pinned: false });
-      } else {
-        await patchEntry(entry.id, { pinned: !stored.pinned });
-      }
-    },
-    [ensureStored]
-  );
-
   const removeEntry = useCallback(async (entry: HubEntry) => {
     await removeEntries([entry.id]);
     setToast({ text: S.toast.removedOne(entry.title) });
   }, []);
+
+  const closeEntry = useCallback(async (entry: HubEntry, band: Band) => {
+    if (band !== "open") {
+      await removeEntry(entry);
+      return;
+    }
+    const targets = openTabs.filter((tab) => tab.key === entry.key && tab.tabId != null);
+    if (!targets.length) return;
+    const ts = Date.now();
+    const snapshot: UndoSnapshot = { urls: targets.map((tab) => tab.url), label: entry.title, ts };
+    await chrome.storage.local.set({ [UNDO_KEY]: snapshot });
+    await chrome.tabs.remove(targets.map((tab) => tab.tabId!));
+    setToast({ text: S.group.closedToast(entry.title, targets.length) });
+  }, [openTabs, removeEntry]);
 
   const undoLater = useCallback(async () => {
     if (!toast?.undo) return;
@@ -700,6 +749,15 @@ export function App() {
 
   const selectKind = useCallback((kind: KindFilter) => {
     setLayout((current) => ({ ...current, kind }));
+  }, []);
+
+  const toggleService = useCallback((id: string) => {
+    setLayout((current) => {
+      const selected = new Set(current.selectedServices);
+      if (selected.has(id)) selected.delete(id);
+      else selected.add(id);
+      return { ...current, selectedServices: [...selected] };
+    });
   }, []);
 
   const toggleBand = useCallback((band: CollapsibleBand) => {
@@ -742,8 +800,64 @@ export function App() {
 
   const pinned = merged.filter((entry) => entry.pinned || entry.chromePinned);
   const ledgerCount = (query.trim() && fullEntries ? fullEntries : index).length;
+
+  const groupRows = useCallback((rows: HubEntry[]): HubGroup[] => {
+    const byKey = new Map<string, HubGroup>();
+    for (const entry of rows) {
+      let key: string;
+      let name: string;
+      if (entry.kind === "web") {
+        const rule = getRuleForEntry(entry);
+        const host = serviceHostname(entry.url) ?? entry.key;
+        key = `web:${host}`;
+        name = rule?.origin === "auto" || rule?.origin === "user"
+          ? rule.label
+          : hostDisplayName(entry.url);
+      } else {
+        name = entry.group === FALLBACK_GROUP ? S.group.misc : entry.group;
+        key = `${entry.kind}:${name}`;
+      }
+      const group = byKey.get(key);
+      if (group) group.entries.push(entry);
+      else byKey.set(key, { key, name, kind: entry.kind, entries: [entry] });
+    }
+
+    const groups = [...byKey.values()];
+    const nameCounts = new Map<string, number>();
+    for (const group of groups) nameCounts.set(group.name, (nameCounts.get(group.name) ?? 0) + 1);
+    for (const group of groups) {
+      if (group.kind !== "web" || (nameCounts.get(group.name) ?? 0) < 2) continue;
+      const label = getRuleForEntry(group.entries[0])?.label;
+      if (label) group.name = `${group.name} · ${label}`;
+    }
+    const singles = groups.filter((group) => group.entries.length === 1);
+    if (singles.length < 2) return groups;
+    const remaining = groups.filter((group) => group.entries.length !== 1);
+    const misc = remaining.find((group) => group.name === S.group.misc);
+    const singleEntries = singles.flatMap((group) => group.entries);
+    if (misc) misc.entries.push(...singleEntries);
+    else remaining.push({ key: "misc:singletons", name: S.group.misc, kind: singles[0].kind, entries: singleEntries });
+    return remaining;
+  }, [getRuleForEntry]);
+
+  const toggleGroup = useCallback((key: string) => {
+    setCollapsedGroups((current) => current.includes(key) ? current.filter((item) => item !== key) : [...current, key]);
+  }, []);
+
+  const closeGroup = useCallback(async (group: HubGroup) => {
+    const keys = new Set(group.entries.map((entry) => entry.key));
+    const targets = openTabs.filter((entry) => keys.has(entry.key) && entry.tabId != null);
+    if (!targets.length) return;
+    const ts = Date.now();
+    const snapshot: UndoSnapshot = { urls: targets.map((entry) => entry.url), label: group.name, ts };
+    await chrome.storage.local.set({ [UNDO_KEY]: snapshot });
+    await chrome.tabs.remove(targets.map((entry) => entry.tabId!));
+    setToast({ text: S.group.closedToast(group.name, targets.length) });
+  }, [openTabs]);
+
   const renderLedgerBand = (band: Band) => {
     const rows = rowsByBand[band];
+    const groups = groupRows(rows);
     const collapsed = layout.collapsedBands.includes(band);
     return (
       <section
@@ -763,22 +877,60 @@ export function App() {
             <span aria-hidden="true">{collapsed ? "▸" : "▾"}</span>
             <span>{S.band[band]}</span>
             <span className="band-count" data-testid={`band-count-${band}`}>{rows.length}</span>
+            <span className="band-line" aria-hidden="true" />
           </button>
         </h3>
         {!collapsed && rows.length > 0 && (
           <div className="band-rows" data-testid={`band-rows-${band}`}>
-            {rows.map((entry) => (
-              <AppRow
-                key={`${band}-${entry.id}`}
-                entry={entry}
-                band={band}
-                showKindIcon={layout.kind === "all"}
-                onOpen={(item, itemBand) => void openEntry(item, itemBand)}
-                onLater={(item) => void moveLater(item)}
-                onPin={(item) => void togglePin(item)}
-                onRemove={(item) => void removeEntry(item)}
-              />
-            ))}
+            {groups.map((group) => {
+              const collapseKey = `${band}:${group.key}`;
+              const groupCollapsed = collapsedGroups.includes(collapseKey);
+              return (
+                <section className="hub-group" data-group-key={group.key} key={collapseKey}>
+                  <div className="group-header">
+                    <span className={`group-dot group-dot-${group.kind}`} aria-hidden="true" />
+                    <span className="group-title">{group.name}</span>
+                    <span className="group-count">{group.entries.length}</span>
+                    <span className="group-actions">
+                      <button
+                        type="button"
+                        className="group-collapse-action"
+                        data-testid={`group-toggle-${collapseKey}`}
+                        title={groupCollapsed ? S.group.expand : S.group.collapse}
+                        aria-label={groupCollapsed ? S.group.expand : S.group.collapse}
+                        aria-expanded={!groupCollapsed}
+                        onClick={() => toggleGroup(collapseKey)}
+                      >
+                        {groupCollapsed ? "▸" : "▾"}
+                      </button>
+                      {band === "open" && (
+                        <button
+                          type="button"
+                          className="group-close-action"
+                          data-testid={`group-close-${collapseKey}`}
+                          title={S.group.closeAll}
+                          aria-label={S.group.closeAll}
+                          onClick={() => void closeGroup(group)}
+                        >
+                          ×
+                        </button>
+                      )}
+                    </span>
+                  </div>
+                  {!groupCollapsed && group.entries.map((entry) => (
+                    <AppRow
+                      key={`${band}-${entry.id}`}
+                      entry={entry}
+                      band={band}
+                      serviceRule={getRuleForEntry(entry)}
+                      onOpen={(item, itemBand) => void openEntry(item, itemBand)}
+                      onLater={(item) => void moveLater(item)}
+                      onClose={(item, itemBand) => void closeEntry(item, itemBand)}
+                    />
+                  ))}
+                </section>
+              );
+            })}
           </div>
         )}
       </section>
@@ -786,46 +938,112 @@ export function App() {
   };
 
   return (
-    <main className="hub-shell" data-testid="hub-shell" data-ready={settings ? "true" : "false"}>
+    <main className="hub-shell" data-testid="hub-shell" data-ready={settings && serviceRules ? "true" : "false"}>
       <header className="hub-header">
-        <label className="search-box">
-          <span aria-hidden="true">⌕</span>
-          <input
-            autoFocus
-            data-testid="hub-search"
-            value={query}
-            placeholder={S.search.placeholder}
-            onChange={(event) => setQuery(event.target.value)}
-            onKeyDown={(event) => void onSearchKeyDown(event)}
-          />
-          {query && (
+        <div className="hub-top">
+          <label className="search-box">
+            <span aria-hidden="true">⌕</span>
+            <input
+              autoFocus
+              data-testid="hub-search"
+              value={query}
+              placeholder={S.search.placeholder}
+              onChange={(event) => setQuery(event.target.value)}
+              onKeyDown={(event) => void onSearchKeyDown(event)}
+            />
+            {query && (
+              <button
+                type="button"
+                title={S.search.clear}
+                aria-label={S.search.clear}
+                onClick={() => setQuery("")}
+              >
+                ×
+              </button>
+            )}
+          </label>
+          <div className="kind-tabs" data-testid="kind-tabs" role="tablist" aria-label={S.tabs.label}>
+            {KIND_FILTERS.map((kind) => {
+              const label = S.kind[kind];
+              const count = kindCounts[kind];
+              return (
+                <button
+                  key={kind}
+                  type="button"
+                  className={`kind-tab kind-tab-${kind}`}
+                  data-testid={`kind-tab-${kind}`}
+                  role="tab"
+                  aria-selected={layout.kind === kind}
+                  title={kind === "all" ? S.tabs.allHint(count) : S.tabs.hint(label, count)}
+                  onClick={() => selectKind(kind)}
+                >
+                  <span>{label}</span>
+                  <span className="kind-count">{count}</span>
+                </button>
+              );
+            })}
+          </div>
+          <div className="tabstrip-actions">
             <button
               type="button"
-              title={S.search.clear}
-              aria-label={S.search.clear}
-              onClick={() => setQuery("")}
+              data-testid="tabstrip-collapse"
+              title={S.tabstrip.collapseHint}
+              disabled={tabstripBusy}
+              onClick={() => void runTabstripAction("collapse-hub-tabs")}
             >
-              ×
+              {S.tabstrip.collapse}
             </button>
-          )}
-        </label>
+            <button
+              type="button"
+              data-testid="tabstrip-expand"
+              title={S.tabstrip.expandHint}
+              disabled={tabstripBusy}
+              onClick={() => void runTabstripAction("expand-hub-tabs")}
+            >
+              {S.tabstrip.expand}
+            </button>
+          </div>
+        </div>
         {query.trim() && merged.length === 0 && bookmarkMatches.length === 0 && (
           <p className="search-hint">{S.search.fallbackHint}</p>
+        )}
+        {(layout.kind === "all" || layout.kind === "web") && serviceChips.length > 0 && (
+          <div className="service-chips" data-testid="service-chips">
+            {serviceChips.map(({ rule, count }) => {
+              const selected = layout.selectedServices.includes(rule.id);
+              return (
+                <button
+                  key={rule.id}
+                  type="button"
+                  className="service-chip"
+                  data-testid={`service-chip-${rule.id}`}
+                  data-service-id={rule.id}
+                  data-count={count}
+                  aria-pressed={selected}
+                  onClick={() => toggleService(rule.id)}
+                >
+                  <span className="service-dot" style={ruleColorStyle(rule)} aria-hidden="true" />
+                  <span>{rule.label}</span>
+                  <span className="service-count">{count}</span>
+                </button>
+              );
+            })}
+          </div>
         )}
       </header>
 
       <section className="pinned-strip" data-testid="pinned-strip">
-        <h1><span aria-hidden="true">📌</span> {S.pinned.heading}</h1>
+        <h1 aria-label={S.pinned.heading} title={S.pinned.heading}><span aria-hidden="true">📌</span></h1>
         <div className="pinned-list">
           {pinned.length ? (
             pinned.map((entry) => (
               <button
                 key={entry.id}
                 type="button"
-                data-entry-id={entry.id}
+                data-pinned-entry-id={entry.id}
                 onClick={() => void openEntry(entry, entry.tabId != null ? "open" : "recent")}
               >
-                <img src={entry.faviconUrl || faviconUrl(entry.url)} alt="" />
+                <Favicon url={entry.url} rule={getRuleForEntry(entry)} />
                 <span>{entry.title}</span>
               </button>
             ))
@@ -835,7 +1053,7 @@ export function App() {
         </div>
       </section>
 
-      <BookmarkStrip nodes={bookmarkNodes} onOpen={(url) => void openBookmark(url)} />
+      <BookmarkStrip nodes={bookmarkNodes} onOpen={(url) => void openBookmark(url)} getRule={getRuleForUrl} />
 
       {index.length === 0 && openTabs.length === 0 && !query.trim() ? (
         <section className="first-run">
@@ -845,51 +1063,6 @@ export function App() {
         </section>
       ) : (
         <section className="hub-list" data-testid="hub-list">
-          <div className="list-toolbar">
-            <div className="kind-tabs" data-testid="kind-tabs" role="tablist" aria-label={S.tabs.label}>
-              {KIND_FILTERS.map((kind) => {
-                const label = S.kind[kind];
-                const count = kindCounts[kind];
-                return (
-                  <button
-                    key={kind}
-                    type="button"
-                    className={`kind-tab kind-tab-${kind}`}
-                    data-testid={`kind-tab-${kind}`}
-                    role="tab"
-                    aria-selected={layout.kind === kind}
-                    title={kind === "all" ? S.tabs.allHint(count) : S.tabs.hint(label, count)}
-                    onClick={() => selectKind(kind)}
-                  >
-                    {kind !== "all" && <span aria-hidden="true">{kindIcon(kind)}</span>}
-                    <span>{label}</span>
-                    <span className="kind-count">{count}</span>
-                  </button>
-                );
-              })}
-            </div>
-            <div className="tabstrip-actions">
-              <button
-                type="button"
-                data-testid="tabstrip-collapse"
-                title={S.tabstrip.collapseHint}
-                disabled={tabstripBusy}
-                onClick={() => void runTabstripAction("collapse-hub-tabs")}
-              >
-                {S.tabstrip.collapse}
-              </button>
-              <button
-                type="button"
-                data-testid="tabstrip-expand"
-                title={S.tabstrip.expandHint}
-                disabled={tabstripBusy}
-                onClick={() => void runTabstripAction("expand-hub-tabs")}
-              >
-                {S.tabstrip.expand}
-              </button>
-            </div>
-          </div>
-
           <div className="band-list">
             {(["open", "recent"] as Band[]).map(renderLedgerBand)}
             {query.trim() && bookmarkMatches.length > 0 && (
@@ -907,14 +1080,15 @@ export function App() {
                     onClick={() => toggleBand("bookmarks")}
                   >
                     <span aria-hidden="true">{layout.collapsedBands.includes("bookmarks") ? "▸" : "▾"}</span>
-                    <span><span aria-hidden="true">⭐</span> {S.bookmarks.band}</span>
-                    <span className="band-count" data-testid="band-count-bookmarks">{bookmarkMatches.length}</span>
+                     <span><span aria-hidden="true">⭐</span> {S.bookmarks.band}</span>
+                     <span className="band-count" data-testid="band-count-bookmarks">{bookmarkMatches.length}</span>
+                     <span className="band-line" aria-hidden="true" />
                   </button>
                 </h3>
                 {!layout.collapsedBands.includes("bookmarks") && (
                   <div className="band-rows" data-testid="band-rows-bookmarks">
                     {bookmarkMatches.map((node) => (
-                      <BookmarkResult key={node.id} node={node} onOpen={(url) => void openBookmark(url)} />
+                      <BookmarkResult key={node.id} node={node} onOpen={(url) => void openBookmark(url)} getRule={getRuleForUrl} />
                     ))}
                   </div>
                 )}

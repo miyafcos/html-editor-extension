@@ -202,23 +202,64 @@ function faviconUrl(url: string): string {
   return chrome.runtime.getURL(`/_favicon/?pageUrl=${encodeURIComponent(url)}&size=32`);
 }
 
+// The SVG hex values below are the approved artwork from spec v0.15.1 and are
+// the explicit exception to the rule that raw colors live only in :root.
+function PdfTypeIcon() {
+  return (
+    <svg className="type-icon" data-type-icon="pdf" width="15" height="15" viewBox="0 0 16 16" aria-hidden="true">
+      <path d="M3.2 1h5.4L13 5.4v9.1a.9.9 0 0 1-.9.9H3.2a.9.9 0 0 1-.9-.9V1.9a.9.9 0 0 1 .9-.9z" fill="#d93025" />
+      <path d="M8.6 1v3.5a.9.9 0 0 0 .9.9H13z" fill="#f6aea9" />
+      <text x="7.7" y="12.6" fontSize="5.2" fontWeight="700" fill="#fff" textAnchor="middle"
+        fontFamily="Segoe UI, Arial, sans-serif" letterSpacing="-.2">PDF</text>
+    </svg>
+  );
+}
+
+function HtmlTypeIcon() {
+  return (
+    <svg className="type-icon" data-type-icon="html" width="15" height="15" viewBox="0 0 16 16" aria-hidden="true">
+      <path d="M3.2 1h5.4L13 5.4v9.1a.9.9 0 0 1-.9.9H3.2a.9.9 0 0 1-.9-.9V1.9a.9.9 0 0 1 .9-.9z" fill="#12b5cb" />
+      <path d="M8.6 1v3.5a.9.9 0 0 0 .9.9H13z" fill="#a1e4ed" />
+      <path d="M6.1 8.3 4.7 10l1.4 1.7M9.5 8.3 10.9 10l-1.4 1.7"
+        stroke="#fff" strokeWidth="1.15" fill="none" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+function WebFallbackIcon() {
+  return (
+    <svg className="type-icon" data-type-icon="web-fallback" width="15" height="15" viewBox="0 0 16 16" aria-hidden="true">
+      <circle cx="8" cy="8" r="6.6" fill="none" stroke="#5f6368" strokeWidth="1.2" />
+      <ellipse cx="8" cy="8" rx="2.9" ry="6.6" fill="none" stroke="#5f6368" strokeWidth="1.2" />
+      <path d="M1.7 6h12.6M1.7 10h12.6" stroke="#5f6368" strokeWidth="1.2" />
+    </svg>
+  );
+}
+
 function ruleColorStyle(rule: ServiceRule | null): React.CSSProperties {
   return { backgroundColor: `var(${rule?.color ?? "--svc-other"})` };
 }
 
-function RemoteFavicon({ url, rule }: { url: string; rule: ServiceRule | null }) {
+function RemoteFavicon({ url }: { url: string }) {
   const [failedUrl, setFailedUrl] = useState<string | null>(null);
   if (failedUrl === url) {
-    return <span className="favicon favicon-fallback" style={ruleColorStyle(rule)} aria-hidden="true" />;
+    return <WebFallbackIcon />;
   }
-  return <img className="favicon" src={faviconUrl(url)} alt="" onError={() => setFailedUrl(url)} />;
+  return <img className="favicon" data-type-icon="web-favicon" src={faviconUrl(url)} alt="" onError={() => setFailedUrl(url)} />;
 }
 
-function Favicon({ url, rule }: { url: string; rule: ServiceRule | null }) {
+function Favicon({ url, rule, kind }: { url: string; rule: ServiceRule | null; kind?: Kind }) {
+  if (kind === "pdf") return <PdfTypeIcon />;
+  if (kind === "html") return <HtmlTypeIcon />;
   if (url.startsWith("file:")) {
     return <span className="favicon favicon-fallback" style={ruleColorStyle(rule)} aria-hidden="true" />;
   }
-  return <RemoteFavicon url={url} rule={rule} />;
+  return <RemoteFavicon url={url} />;
+}
+
+function rowExtension(entry: HubEntry): string | null {
+  if (entry.kind !== "html" && entry.kind !== "pdf") return null;
+  return entry.path.match(/\.(?:html?|pdf)$/i)?.[0].toLowerCase() ?? null;
 }
 
 function bookmarkBarChildren(tree: chrome.bookmarks.BookmarkTreeNode[]): chrome.bookmarks.BookmarkTreeNode[] {
@@ -443,7 +484,7 @@ function HubIndexResult({
       title={`${row.t}\n${row.d}\n${url}`}
       onClick={() => onOpen(url)}
     >
-      <span className="hub-index-mark" aria-hidden="true" />
+      <HtmlTypeIcon />
       <span className="hub-index-copy">
         <span className="hub-index-title">{row.t}</span>
         <span className="hub-index-meta">{metadata}</span>
@@ -459,6 +500,7 @@ function AppRow({
   controlsReady,
   onOpen,
   onLater,
+  onPin,
   onClose
 }: {
   entry: HubEntry;
@@ -466,10 +508,14 @@ function AppRow({
   serviceRule: ServiceRule | null;
   controlsReady: boolean;
   onOpen: (entry: HubEntry, band: Band) => void;
-  onLater: (entry: HubEntry) => void;
+  onLater: (entry: HubEntry, band: Band) => void;
+  onPin: (entry: HubEntry) => void;
   onClose: (entry: HubEntry, band: Band) => void;
 }) {
   const openLabel = band === "open" ? S.action.switchTo : S.action.openNew;
+  const extension = rowExtension(entry);
+  const laterLabel = band === "later" ? S.action.laterUndo : S.action.later;
+  const pinLabel = entry.pinned ? S.action.unpin : S.action.pin;
   return (
     <article
       className="hub-row"
@@ -482,6 +528,7 @@ function AppRow({
       aria-label={`${openLabel}: ${entry.title}`}
       onClick={() => onOpen(entry, band)}
       onKeyDown={(event) => {
+        if (event.target !== event.currentTarget) return;
         if (event.key === "ArrowUp" || event.key === "ArrowDown") {
           const rows = [...document.querySelectorAll<HTMLElement>(".hub-row")];
           const index = rows.indexOf(event.currentTarget);
@@ -498,23 +545,38 @@ function AppRow({
         }
       }}
     >
-      <Favicon url={entry.url} rule={serviceRule} />
-      <span className="row-copy">{entry.title || fileName(entry.path)}</span>
+      <Favicon url={entry.url} rule={serviceRule} kind={entry.kind} />
+      <span className="row-body">
+        <span className="row-title">{entry.title || fileName(entry.path)}</span>
+        {extension && <span className="row-ext">{extension}</span>}
+      </span>
       {controlsReady && <span className="row-actions">
-        {band === "open" && (
-          <button
-            type="button"
-            data-testid={`later-${entry.id}`}
-            title={S.action.later}
-            aria-label={S.action.later}
-            onClick={(event) => {
-              event.stopPropagation();
-              onLater(entry);
-            }}
-          >
-            🕐
-          </button>
-        )}
+        <button
+          type="button"
+          data-testid={`later-${entry.id}`}
+          title={laterLabel}
+          aria-label={laterLabel}
+          onClick={(event) => {
+            event.stopPropagation();
+            onLater(entry, band);
+          }}
+        >
+          🕐
+        </button>
+        <button
+          type="button"
+          className={`pin-action${entry.pinned ? " is-active" : ""}`}
+          data-testid={`pin-${entry.id}`}
+          title={pinLabel}
+          aria-label={pinLabel}
+          aria-pressed={entry.pinned}
+          onClick={(event) => {
+            event.stopPropagation();
+            onPin(entry);
+          }}
+        >
+          📌
+        </button>
         <button
           type="button"
           data-testid={`remove-${entry.id}`}
@@ -1094,15 +1156,36 @@ export function App() {
   }, []);
 
   const moveLater = useCallback(
-    async (entry: HubEntry) => {
+    async (entry: HubEntry, band: Band) => {
+      const ts = Date.now();
+      if (band === "recent") {
+        await patchEntry(entry.id, { later: true, laterAt: ts });
+        return;
+      }
+      if (band === "later") {
+        await patchEntry(entry.id, {
+          later: false,
+          laterAt: null,
+          lastSeenAt: ts,
+          visitCount: Math.max(2, entry.visitCount)
+        });
+        return;
+      }
       if (entry.tabId == null) return;
       await ensureStored(entry);
-      const ts = Date.now();
       await patchEntry(entry.id, { later: true, laterAt: ts });
       const snapshot: UndoSnapshot = { urls: [entry.url], label: S.band.later, ts };
       await chrome.storage.local.set({ [UNDO_KEY]: snapshot });
       await chrome.tabs.remove(entry.tabId);
       setToast({ text: S.toast.closedOne(entry.title), undo: { entry, ts } });
+    },
+    [ensureStored]
+  );
+
+  const togglePinned = useCallback(
+    async (entry: HubEntry) => {
+      await ensureStored(entry);
+      await patchEntry(entry.id, { pinned: !entry.pinned });
     },
     [ensureStored]
   );
@@ -1131,10 +1214,15 @@ export function App() {
     void openEntry(entry, band);
   }, [hidePreview, openEntry]);
 
-  const handleRowLater = useCallback((entry: HubEntry) => {
+  const handleRowLater = useCallback((entry: HubEntry, band: Band) => {
     hidePreview(entry.id, false);
-    void moveLater(entry);
+    void moveLater(entry, band);
   }, [hidePreview, moveLater]);
+
+  const handleRowPin = useCallback((entry: HubEntry) => {
+    hidePreview(entry.id, false);
+    void togglePinned(entry);
+  }, [hidePreview, togglePinned]);
 
   const handleRowClose = useCallback((entry: HubEntry, band: Band) => {
     hidePreview(entry.id, false);
@@ -1398,6 +1486,7 @@ export function App() {
                       controlsReady={controlsReady}
                       onOpen={handleRowOpen}
                       onLater={handleRowLater}
+                      onPin={handleRowPin}
                       onClose={handleRowClose}
                     />
                   ))}
@@ -1558,28 +1647,31 @@ export function App() {
         )}
       </header>
 
-      <section className="pinned-strip" data-testid="pinned-strip">
-        <h1 aria-label={S.pinned.heading} title={S.pinned.heading}><span aria-hidden="true">📌</span></h1>
-        <div className="pinned-list">
-          {pinned.length ? (
-            pinned.map((entry) => (
-              <button
-                key={entry.id}
-                type="button"
-                data-pinned-entry-id={entry.id}
-                onClick={() => void openEntry(entry, entry.tabId != null ? "open" : "recent")}
-              >
-                <Favicon url={entry.url} rule={getRuleForEntry(entry)} />
-                <span>{entry.title}</span>
-              </button>
-            ))
-          ) : (
-            <p>{S.pinned.empty}</p>
+      {(bookmarkNodes.length > 0 || pinned.length > 0) && (
+        <div className="shortcut-strip" data-testid="shortcut-strip">
+          {bookmarkNodes.length > 0 && (
+            <BookmarkStrip nodes={bookmarkNodes} onOpen={(url) => void openBookmark(url)} getRule={getRuleForUrl} />
+          )}
+          {pinned.length > 0 && (
+            <section className="pinned-strip" data-testid="pinned-strip">
+              <h1 aria-label={S.pinned.heading} title={S.pinned.heading}><span aria-hidden="true">📌</span></h1>
+              <div className="pinned-list">
+                {pinned.map((entry) => (
+                  <button
+                    key={entry.id}
+                    type="button"
+                    data-pinned-entry-id={entry.id}
+                    onClick={() => void openEntry(entry, entry.tabId != null ? "open" : "recent")}
+                  >
+                    <Favicon url={entry.url} rule={getRuleForEntry(entry)} kind={entry.kind} />
+                    <span>{entry.title}</span>
+                  </button>
+                ))}
+              </div>
+            </section>
           )}
         </div>
-      </section>
-
-      <BookmarkStrip nodes={bookmarkNodes} onOpen={(url) => void openBookmark(url)} getRule={getRuleForUrl} />
+      )}
 
       {index.length === 0 && openTabs.length === 0 && !query.trim() ? (
         <section className="first-run">

@@ -2048,6 +2048,432 @@ try {
   );
   check("al. a missing index silently omits only the hub band", alSettledState?.ledger && alSettledState.fetches === 1 && alSettledState.settled && !alSettledState.band && alSettledState.ready === "true" && alSettledState.errors === 0, JSON.stringify(alDiagnostic));
 
+  await resetHubFixture(cdp, control.sessionId);
+  const v151At = Date.now();
+  const v151Pdf = fixtureEntry({
+    id: "v151-pdf",
+    url: "file:///C:/e2e/type-icons/Short.Report.PDF",
+    kind: "pdf",
+    title: "Short report",
+    at: v151At
+  });
+  const v151Html = fixtureEntry({
+    id: "v151-html",
+    url: "file:///C:/e2e/type-icons/long-document.HTML",
+    kind: "html",
+    title: "A deliberately extreme title ".repeat(24),
+    at: v151At - 1
+  });
+  const v151Web = fixtureEntry({
+    id: "v151-web",
+    url: `https://example.com/v151-favicon-${v151At}`,
+    kind: "web",
+    title: "Web fallback fixture",
+    at: v151At - 2
+  });
+  const v151Entries = [v151Pdf, v151Html, v151Web];
+  await evalIn(
+    cdp,
+    control.sessionId,
+    `chrome.storage.local.set({
+      ...${JSON.stringify(entryRecord(v151Entries))},
+      'index:newtab': ${JSON.stringify(v151Entries)},
+      [${JSON.stringify(HUB_INDEX_SETTINGS_KEY)}]: { sourceUrl: ${JSON.stringify(HUB_INDEX_SMALL_URL)} }
+    })`
+  );
+  hub = await openHub(cdp, control, extensionId, { initScript: hubIndexSpyScript([HUB_INDEX_SMALL_URL]) });
+  const v151IconState = await waitFor(() =>
+    evalIn(
+      cdp,
+      hub.sessionId,
+      `(() => {
+        const pdf = document.querySelector('[data-entry-id="v151-pdf"]');
+        const html = document.querySelector('[data-entry-id="v151-html"]');
+        const web = document.querySelector('[data-entry-id="v151-web"]');
+        if (!pdf || !html || !web) return null;
+        const pdfSvg = pdf.querySelector('svg[data-type-icon="pdf"]');
+        const htmlSvg = html.querySelector('svg[data-type-icon="html"]');
+        const resources = performance.getEntriesByType('resource').map((entry) => entry.name);
+        return {
+          pdfIcon: Boolean(pdfSvg),
+          pdfSize: pdfSvg ? [pdfSvg.getBoundingClientRect().width, pdfSvg.getBoundingClientRect().height] : null,
+          pdfViewBox: pdfSvg?.getAttribute('viewBox'),
+          pdfPaths: pdfSvg ? [...pdfSvg.querySelectorAll('path')].map((path) => [path.getAttribute('d'), path.getAttribute('fill')]) : [],
+          pdfText: pdfSvg?.querySelector('text')?.textContent,
+          pdfTextSize: pdfSvg?.querySelector('text')?.getAttribute('font-size'),
+          pdfFavicon: Boolean(pdf.querySelector('img[src*="/_favicon/"]')),
+          htmlIcon: Boolean(htmlSvg),
+          htmlSize: htmlSvg ? [htmlSvg.getBoundingClientRect().width, htmlSvg.getBoundingClientRect().height] : null,
+          htmlViewBox: htmlSvg?.getAttribute('viewBox'),
+          htmlPaths: htmlSvg ? [...htmlSvg.querySelectorAll('path')].map((path) => ({ d: path.getAttribute('d'), fill: path.getAttribute('fill'), stroke: path.getAttribute('stroke'), strokeWidth: path.getAttribute('stroke-width') })) : [],
+          htmlFavicon: Boolean(html.querySelector('img[src*="/_favicon/"]')),
+          localFaviconRequests: resources.filter((name) => name.includes('/_favicon/') && (name.includes(encodeURIComponent(${JSON.stringify(v151Pdf.url)})) || name.includes(encodeURIComponent(${JSON.stringify(v151Html.url)})))).length,
+          webFavicon: Boolean(web.querySelector('img[src*="/_favicon/"]'))
+        };
+      })()`,
+      1
+    )
+  );
+  check(
+    "ao. pdf rows use the inline PDF document icon without _favicon",
+    v151IconState?.pdfIcon &&
+      stableStringify(v151IconState.pdfSize) === stableStringify([15, 15]) &&
+      v151IconState.pdfViewBox === "0 0 16 16" &&
+      stableStringify(v151IconState.pdfPaths) === stableStringify([
+        ["M3.2 1h5.4L13 5.4v9.1a.9.9 0 0 1-.9.9H3.2a.9.9 0 0 1-.9-.9V1.9a.9.9 0 0 1 .9-.9z", "#d93025"],
+        ["M8.6 1v3.5a.9.9 0 0 0 .9.9H13z", "#f6aea9"]
+      ]) &&
+      v151IconState.pdfText === "PDF" && v151IconState.pdfTextSize === "5.2" &&
+      !v151IconState.pdfFavicon && v151IconState.localFaviconRequests === 0,
+    JSON.stringify(v151IconState)
+  );
+  check(
+    "ap. html rows use the inline HTML document icon without _favicon",
+    v151IconState?.htmlIcon &&
+      stableStringify(v151IconState.htmlSize) === stableStringify([15, 15]) &&
+      v151IconState.htmlViewBox === "0 0 16 16" &&
+      v151IconState.htmlPaths[0]?.fill === "#12b5cb" &&
+      v151IconState.htmlPaths[1]?.fill === "#a1e4ed" &&
+      v151IconState.htmlPaths[2]?.d === "M6.1 8.3 4.7 10l1.4 1.7M9.5 8.3 10.9 10l-1.4 1.7" &&
+      v151IconState.htmlPaths[2]?.stroke === "#fff" && v151IconState.htmlPaths[2]?.strokeWidth === "1.15" &&
+      !v151IconState.htmlFavicon && v151IconState.localFaviconRequests === 0,
+    JSON.stringify(v151IconState)
+  );
+
+  await evalIn(
+    cdp,
+    hub.sessionId,
+    `document.querySelector('[data-entry-id="v151-web"] img.favicon')?.dispatchEvent(new Event('error'))`,
+    1
+  );
+  const aqState = await waitFor(() =>
+    evalIn(
+      cdp,
+      hub.sessionId,
+      `(() => {
+        const globe = document.querySelector('[data-entry-id="v151-web"] svg[data-type-icon="web-fallback"]');
+        const circle = globe?.querySelector('circle');
+        const ellipse = globe?.querySelector('ellipse');
+        const path = globe?.querySelector('path');
+        const rect = globe?.getBoundingClientRect();
+        return globe ? {
+          size: [rect.width, rect.height],
+          viewBox: globe.getAttribute('viewBox'),
+          circle: [circle?.getAttribute('cx'), circle?.getAttribute('cy'), circle?.getAttribute('r'), circle?.getAttribute('stroke')],
+          ellipse: [ellipse?.getAttribute('cx'), ellipse?.getAttribute('cy'), ellipse?.getAttribute('rx'), ellipse?.getAttribute('ry')],
+          path: [path?.getAttribute('d'), path?.getAttribute('stroke'), path?.getAttribute('stroke-width')]
+        } : null;
+      })()`,
+      1
+    )
+  );
+  check(
+    "aq. failed web favicons fall back to the inline globe",
+    stableStringify(aqState?.size) === stableStringify([15, 15]) &&
+      aqState?.viewBox === "0 0 16 16" &&
+      stableStringify(aqState.circle) === stableStringify(["8", "8", "6.6", "#5f6368"]) &&
+      stableStringify(aqState.ellipse) === stableStringify(["8", "8", "2.9", "6.6"]) &&
+      stableStringify(aqState.path) === stableStringify(["M1.7 6h12.6M1.7 10h12.6", "#5f6368", "1.2"]),
+    JSON.stringify(aqState)
+  );
+
+  const extensionState = await evalIn(
+    cdp,
+    hub.sessionId,
+    `(() => {
+      const pdf = document.querySelector('[data-entry-id="v151-pdf"]');
+      const html = document.querySelector('[data-entry-id="v151-html"]');
+      const web = document.querySelector('[data-entry-id="v151-web"]');
+      const title = html.querySelector('.row-title');
+      const ext = html.querySelector('.row-ext');
+      const body = html.querySelector('.row-body');
+      const titleRect = title.getBoundingClientRect();
+      const extRect = ext.getBoundingClientRect();
+      const bodyRect = body.getBoundingClientRect();
+      const pdfTitleRect = pdf.querySelector('.row-title').getBoundingClientRect();
+      const pdfExtRect = pdf.querySelector('.row-ext').getBoundingClientRect();
+      return {
+        pdf: pdf.querySelector('.row-ext')?.textContent,
+        html: ext?.textContent,
+        web: web.querySelector('.row-ext')?.textContent ?? null,
+        longTitleClipped: title.scrollWidth > title.clientWidth,
+        extWidth: extRect.width,
+        extInside: extRect.right <= bodyRect.right + 0.5,
+        shortTitleGap: pdfExtRect.left - pdfTitleRect.right
+      };
+    })()`
+  );
+  check("ar. only html and pdf rows show lowercase file extensions", extensionState?.pdf === ".pdf" && extensionState.html === ".html" && extensionState.web === null, JSON.stringify(extensionState));
+  check("as. long titles ellipsize while the adjacent extension remains visible", extensionState?.longTitleClipped && extensionState.extWidth > 0 && extensionState.extInside && extensionState.shortTitleGap >= 3.5 && extensionState.shortTitleGap <= 4.5, JSON.stringify(extensionState));
+
+  await setSearchQuery(cdp, hub.sessionId, "descneedle");
+  const atState = await waitFor(() =>
+    evalIn(
+      cdp,
+      hub.sessionId,
+      `(() => {
+        const row = document.querySelector('[data-hub-index-id=${JSON.stringify(HUB_INDEX_FIXTURE_IDS.description)}]');
+        const icon = row?.querySelector('svg[data-type-icon="html"]');
+        const rect = icon?.getBoundingClientRect();
+        return row ? { htmlIcon: Boolean(icon), size: rect ? [rect.width, rect.height] : null, fill: icon?.querySelector('path')?.getAttribute('fill'), favicon: Boolean(row.querySelector('img[src*="/_favicon/"]')) } : null;
+      })()`,
+      1
+    )
+  );
+  check("at. hub-index rows use the inline HTML icon", atState?.htmlIcon && stableStringify(atState.size) === stableStringify([15, 15]) && atState.fill === "#12b5cb" && !atState.favicon, JSON.stringify(atState));
+
+  const tokenState = await evalIn(
+    cdp,
+    hub.sessionId,
+    `(() => {
+      const root = getComputedStyle(document.documentElement);
+      const css = [...document.styleSheets].flatMap((sheet) => [...sheet.cssRules].map((rule) => rule.cssText)).join('\\n').toLowerCase();
+      return {
+        html: root.getPropertyValue('--kind-html').trim().toLowerCase(),
+        htmlLight: root.getPropertyValue('--kind-html-light').trim().toLowerCase(),
+        pdfLight: root.getPropertyValue('--kind-pdf-light').trim().toLowerCase(),
+        internal: root.getPropertyValue('--svc-internal').trim().toLowerCase(),
+        oldHtmlCount: (css.match(/#1e8e3e/g) ?? []).length,
+        htmlReferences: (css.match(/var\\(--kind-html\\)/g) ?? []).length
+      };
+    })()`
+  );
+  check("au. the HTML kind token is cyan with no rejected green left in CSS", tokenState?.html === "#12b5cb" && tokenState.oldHtmlCount === 0 && tokenState.htmlReferences >= 3, JSON.stringify(tokenState));
+  check("av. internal service cyan is distinct and both light kind tokens exist", tokenState?.internal === "#00838f" && tokenState.internal !== tokenState.html && tokenState.htmlLight === "#a1e4ed" && tokenState.pdfLight === "#f6aea9", JSON.stringify(tokenState));
+
+  await resetHubFixture(cdp, control.sessionId);
+  const shortcutPinned = fixtureEntry({
+    id: "v151-shortcut-pin",
+    url: "file:///C:/e2e/type-icons/pinned.html",
+    kind: "html",
+    title: "Pinned shortcut",
+    at: Date.now()
+  });
+  shortcutPinned.pinned = true;
+  await evalIn(
+    cdp,
+    control.sessionId,
+    `chrome.storage.local.set({ ...${JSON.stringify(entryRecord([shortcutPinned]))}, 'index:newtab': ${JSON.stringify([shortcutPinned])} })`
+  );
+  hub = await openHub(cdp, control, extensionId);
+  const shortcutState = await waitFor(() =>
+    evalIn(
+      cdp,
+      hub.sessionId,
+      `(() => {
+        const row = document.querySelector('[data-testid="shortcut-strip"]');
+        const bookmarks = document.querySelector('[data-testid="bookmark-strip"]');
+        const pinned = document.querySelector('[data-testid="pinned-strip"]');
+        if (!row || !bookmarks || !pinned) return null;
+        const relation = bookmarks.compareDocumentPosition(pinned);
+        return {
+          sameParent: bookmarks.parentElement === row && pinned.parentElement === row,
+          bookmarkBeforePinned: Boolean(relation & Node.DOCUMENT_POSITION_FOLLOWING),
+          sameTop: Math.abs(bookmarks.getBoundingClientRect().top - pinned.getBoundingClientRect().top) < 1,
+          height: row.getBoundingClientRect().height,
+          gap: getComputedStyle(row).gap,
+          bookmarkMaxWidth: getComputedStyle(bookmarks).maxWidth,
+          bookmarkFlexGrow: getComputedStyle(bookmarks).flexGrow,
+          pinnedFlexGrow: getComputedStyle(pinned).flexGrow,
+          bookmarkOverflow: getComputedStyle(bookmarks.querySelector('[data-testid="bookmark-chips"]')).overflowX,
+          pinnedOverflow: getComputedStyle(pinned.querySelector('.pinned-list')).overflowX,
+          bookmarkHeading: bookmarks.querySelector('h2')?.textContent.trim(),
+          pinnedHeading: pinned.querySelector('h1')?.textContent.trim()
+        };
+      })()`,
+      1
+    )
+  );
+  check("aw. bookmarks and pinned shortcuts share one row in that DOM order", shortcutState?.sameParent && shortcutState.bookmarkBeforePinned && shortcutState.sameTop && shortcutState.height === 28 && shortcutState.gap === "16px" && shortcutState.bookmarkMaxWidth === "45%" && shortcutState.bookmarkFlexGrow === "0" && shortcutState.pinnedFlexGrow === "1" && shortcutState.bookmarkOverflow === "auto" && shortcutState.pinnedOverflow === "auto" && shortcutState.bookmarkHeading === "⭐" && shortcutState.pinnedHeading === "📌", JSON.stringify(shortcutState));
+
+  await evalIn(
+    cdp,
+    control.sessionId,
+    `(async () => {
+      const [root] = await chrome.bookmarks.getTree();
+      const other = root.children?.find((node) => node.id === '2') ?? root.children?.find((node) => node.id !== '1' && !node.url);
+      if (!other) throw new Error('other bookmarks folder not found');
+      await chrome.bookmarks.move(${JSON.stringify(bookmarkFixture.folderId)}, { parentId: other.id });
+      await chrome.bookmarks.move(${JSON.stringify(bookmarkFixture.directId)}, { parentId: other.id });
+      return true;
+    })()`
+  );
+  const axPinnedOnly = await waitFor(() =>
+    evalIn(
+      cdp,
+      hub.sessionId,
+      `!document.querySelector('[data-testid="bookmark-strip"]') && Boolean(document.querySelector('[data-testid="pinned-strip"]')) && Boolean(document.querySelector('[data-testid="shortcut-strip"]'))`,
+      1
+    )
+  );
+  shortcutPinned.pinned = false;
+  await evalIn(
+    cdp,
+    control.sessionId,
+    `chrome.storage.local.set({ ...${JSON.stringify(entryRecord([shortcutPinned]))}, 'index:newtab': ${JSON.stringify([shortcutPinned])} })`
+  );
+  const axEmpty = await waitFor(() =>
+    evalIn(cdp, hub.sessionId, `!document.querySelector('[data-testid="shortcut-strip"]')`, 1)
+  );
+  check("ax. empty shortcut blocks and the empty combined row are omitted", Boolean(axPinnedOnly) && Boolean(axEmpty), `pinnedOnly=${Boolean(axPinnedOnly)} empty=${Boolean(axEmpty)}`);
+  await evalIn(
+    cdp,
+    control.sessionId,
+    `(async () => {
+      await chrome.bookmarks.move(${JSON.stringify(bookmarkFixture.folderId)}, { parentId: '1' });
+      await chrome.bookmarks.move(${JSON.stringify(bookmarkFixture.directId)}, { parentId: '1' });
+      return true;
+    })()`
+  );
+
+  await resetHubFixture(cdp, control.sessionId);
+  const actionOpenUrl = `https://example.com/v151-open-${Date.now()}`;
+  await openTab(cdp, control.sessionId, actionOpenUrl);
+  const actionOpen = await waitForEntry(cdp, control.sessionId, actionOpenUrl);
+  const actionAt = Date.now();
+  const actionRecent = fixtureEntry({
+    id: "v151-action-recent",
+    url: "file:///C:/e2e/actions/recent.html",
+    kind: "html",
+    title: "Recent action row",
+    at: actionAt
+  });
+  const actionLater = fixtureEntry({
+    id: "v151-action-later",
+    url: "file:///C:/e2e/actions/later.pdf",
+    kind: "pdf",
+    title: "Later action row",
+    at: actionAt - 30 * 24 * 60 * 60 * 1000
+  });
+  actionLater.visitCount = 1;
+  actionLater.later = true;
+  actionLater.laterAt = actionAt;
+  const actionEntries = [actionRecent, actionLater];
+  await evalIn(
+    cdp,
+    control.sessionId,
+    `chrome.storage.local.set({ ...${JSON.stringify(entryRecord(actionEntries))}, 'index:newtab': ${JSON.stringify(actionEntries)} })`
+  );
+  hub = await openHub(cdp, control, extensionId);
+  const actionIds = {
+    open: actionOpen?.entry.id,
+    recent: actionRecent.id,
+    later: actionLater.id
+  };
+  const ayState = await waitFor(() =>
+    evalIn(
+      cdp,
+      hub.sessionId,
+      `(() => {
+        const ids = ${JSON.stringify(actionIds)};
+        const state = {};
+        for (const band of ['open', 'recent', 'later']) {
+          const id = ids[band];
+          const row = document.querySelector('[data-testid="row-' + band + '-' + id + '"]');
+          const buttons = row ? [...row.querySelectorAll('.row-actions button')] : [];
+          const actions = row?.querySelector('.row-actions');
+          state[band] = {
+            count: buttons.length,
+            labels: buttons.map((button) => button.textContent.trim()),
+            titles: buttons.map((button) => button.title),
+            widths: buttons.map((button) => getComputedStyle(button).width),
+            heights: buttons.map((button) => getComputedStyle(button).height),
+            gap: actions ? getComputedStyle(actions).gap : null
+          };
+        }
+        return Object.values(state).every((item) => item.count === 3) ? state : null;
+      })()`,
+      1
+    )
+  );
+  check(
+    "ay. every band renders clock, pin, and remove row actions",
+    ayState &&
+      Object.values(ayState).every((item) =>
+        JSON.stringify(item.labels) === JSON.stringify(["🕐", "📌", "×"]) &&
+        item.titles[1] === S.action.pin && item.titles[2] === S.action.remove &&
+        item.widths.every((width) => width === "20px") && item.heights.every((height) => height === "20px") && item.gap === "0px"
+      ) &&
+      ayState.open.titles[0] === S.action.later && ayState.recent.titles[0] === S.action.later && ayState.later.titles[0] === S.action.laterUndo,
+    JSON.stringify(ayState)
+  );
+
+  const tabsBeforeRecentLater = await evalIn(cdp, control.sessionId, "chrome.tabs.query({}).then((tabs) => tabs.map((tab) => tab.id).sort((a, b) => a - b))");
+  await evalIn(cdp, hub.sessionId, `document.querySelector('[data-testid="later-${actionRecent.id}"]').click()`, 1);
+  const azState = await waitFor(async () => {
+    const stored = await evalIn(
+      cdp,
+      control.sessionId,
+      `chrome.storage.local.get('entry:${actionRecent.id}').then((got) => got['entry:${actionRecent.id}'])`,
+      1
+    );
+    const moved = await evalIn(cdp, hub.sessionId, `Boolean(document.querySelector('[data-testid="row-later-${actionRecent.id}"]'))`, 1);
+    return stored?.later && moved ? { stored, moved } : null;
+  });
+  const tabsAfterRecentLater = await evalIn(cdp, control.sessionId, "chrome.tabs.query({}).then((tabs) => tabs.map((tab) => tab.id).sort((a, b) => a - b))");
+  check("az. recent clock moves the ledger row to later without closing a tab", azState?.stored.laterAt > 0 && stableStringify(tabsBeforeRecentLater) === stableStringify(tabsAfterRecentLater), `state=${JSON.stringify(azState)} before=${JSON.stringify(tabsBeforeRecentLater)} after=${JSON.stringify(tabsAfterRecentLater)}`);
+
+  await evalIn(cdp, hub.sessionId, `document.querySelector('[data-testid="later-${actionLater.id}"]').click()`, 1);
+  const baState = await waitFor(async () => {
+    const stored = await evalIn(
+      cdp,
+      control.sessionId,
+      `chrome.storage.local.get('entry:${actionLater.id}').then((got) => got['entry:${actionLater.id}'])`,
+      1
+    );
+    const recent = await evalIn(cdp, hub.sessionId, `Boolean(document.querySelector('[data-testid="row-recent-${actionLater.id}"]'))`, 1);
+    return stored && !stored.later && stored.laterAt === null && stored.visitCount >= 2 && stored.lastSeenAt > actionAt && recent
+      ? { later: stored.later, laterAt: stored.laterAt, visitCount: stored.visitCount, lastSeenAt: stored.lastSeenAt, recent }
+      : null;
+  });
+  check("ba. later clock restores even a one-visit old row to recent", Boolean(baState), JSON.stringify(baState));
+
+  await evalIn(cdp, hub.sessionId, `document.querySelector('[data-testid="pin-${actionLater.id}"]').click()`, 1);
+  const bbPinned = await waitFor(async () => {
+    const stored = await evalIn(
+      cdp,
+      control.sessionId,
+      `chrome.storage.local.get('entry:${actionLater.id}').then((got) => got['entry:${actionLater.id}'])`,
+      1
+    );
+    const visible = await evalIn(
+      cdp,
+      hub.sessionId,
+      `(() => {
+        document.querySelector('[data-testid="hub-search"]')?.focus();
+        const row = document.querySelector('[data-testid="row-recent-${actionLater.id}"]');
+        const button = row?.querySelector('[data-testid="pin-${actionLater.id}"]');
+        if (!row || !button) return null;
+        const actions = button.closest('.row-actions');
+        const rect = button.getBoundingClientRect();
+        return {
+          active: button.classList.contains('is-active'),
+          pressed: button.getAttribute('aria-pressed'),
+          title: button.title,
+          opacity: getComputedStyle(button).opacity,
+          visibility: getComputedStyle(button).visibility,
+          parentOpacity: getComputedStyle(actions).opacity,
+          parentVisibility: getComputedStyle(actions).visibility,
+          rect: [rect.width, rect.height],
+          hovered: row.matches(':hover'),
+          focused: row.contains(document.activeElement)
+        };
+      })()`,
+      1
+    );
+    return stored?.pinned && visible?.active && visible.pressed === "true" && visible.title === S.action.unpin && Number(visible.opacity) > 0 && Number(visible.parentOpacity) > 0 && visible.visibility === "visible" && visible.parentVisibility === "visible" && visible.rect[0] > 0 && visible.rect[1] > 0 && !visible.hovered && !visible.focused ? visible : null;
+  });
+  await evalIn(cdp, hub.sessionId, `document.querySelector('[data-testid="pin-${actionLater.id}"]').click()`, 1);
+  const bbUnpinned = await waitFor(() =>
+    evalIn(
+      cdp,
+      control.sessionId,
+      `chrome.storage.local.get('entry:${actionLater.id}').then((got) => got['entry:${actionLater.id}']?.pinned === false)`,
+      1
+    )
+  );
+  check("bb. pin toggles ledger state and an active pin remains visible without hover", Boolean(bbPinned) && Boolean(bbUnpinned), `pinned=${JSON.stringify(bbPinned)} unpinned=${Boolean(bbUnpinned)}`);
+
   await evalIn(
     cdp,
     control.sessionId,

@@ -49,6 +49,7 @@ export default defineManifest({
     "webNavigation",
     "alarms",
     "search",
+    "bookmarks",
     "favicon"
   ],
   host_permissions: ["<all_urls>"],

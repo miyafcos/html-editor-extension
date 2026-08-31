@@ -757,6 +757,212 @@ try {
     `stored=${JSON.stringify(layoutStored)} restored=${JSON.stringify(restoredLayout)}`
   );
 
+  await cdp.send("Target.closeTarget", { targetId: hub.targetId });
+  const bookmarkUrl = `https://example.com/?hub-bookmark=${Date.now()}`;
+  const directBookmarkUrl = `https://example.com/?hub-direct-bookmark=${Date.now()}`;
+  const bookmarkFixture = await evalIn(
+    cdp,
+    control.sessionId,
+    `(async () => {
+      const [root] = await chrome.bookmarks.getTree();
+      const bar = root.children?.find((node) => node.id === '1') ?? root.children?.find((node) => !node.url);
+      if (!bar) throw new Error('bookmark bar not found');
+      const folder = await chrome.bookmarks.create({ parentId: bar.id, title: 'Hub E2E Folder' });
+      const link = await chrome.bookmarks.create({ parentId: folder.id, title: 'Hub Bookmark Search Result', url: ${JSON.stringify(bookmarkUrl)} });
+      const direct = await chrome.bookmarks.create({ parentId: bar.id, title: 'Hub Direct Bookmark', url: ${JSON.stringify(directBookmarkUrl)} });
+      return { folderId: folder.id, linkId: link.id, directId: direct.id };
+    })()`
+  );
+  await sleep(800);
+  const entryCountBeforeBookmarks = await evalIn(
+    cdp,
+    control.sessionId,
+    "chrome.storage.local.get(null).then((all) => Object.keys(all).filter((key) => key.startsWith('entry:')).length)"
+  );
+
+  hub = await openHub(cdp, control, extensionId);
+  const bookmarkStripState = await waitFor(() =>
+    evalIn(
+      cdp,
+      hub.sessionId,
+      `(() => {
+        const strip = document.querySelector('[data-testid="bookmark-strip"]');
+        const folder = document.querySelector('[data-testid=${JSON.stringify(`bookmark-folder-${bookmarkFixture.folderId}`)}]');
+        const direct = document.querySelector('[data-testid=${JSON.stringify(`bookmark-direct-${bookmarkFixture.directId}`)}]');
+        return strip && folder && direct ? { folder: folder.textContent.trim(), direct: direct.textContent.trim() } : null;
+      })()`,
+      1
+    )
+  );
+  await sleep(500);
+  const entryCountAfterStrip = await evalIn(
+    cdp,
+    control.sessionId,
+    "chrome.storage.local.get(null).then((all) => Object.keys(all).filter((key) => key.startsWith('entry:')).length)"
+  );
+  check(
+    "l. bookmark create renders strip chips",
+    bookmarkStripState?.folder.includes("Hub E2E Folder") && bookmarkStripState?.direct.includes("Hub Direct Bookmark"),
+    JSON.stringify(bookmarkStripState)
+  );
+
+  await evalIn(
+    cdp,
+    hub.sessionId,
+    `document.querySelector('[data-testid=${JSON.stringify(`bookmark-folder-${bookmarkFixture.folderId}`)}]').click()`,
+    1
+  );
+  const bookmarkDropdown = await waitFor(() =>
+    evalIn(
+      cdp,
+      hub.sessionId,
+      `(() => {
+        const menu = document.querySelector('[data-testid="bookmark-dropdown"]');
+        const link = document.querySelector('[data-testid=${JSON.stringify(`bookmark-item-link-${bookmarkFixture.linkId}`)}]');
+        return menu && link ? { title: link.textContent.trim() } : null;
+      })()`,
+      1
+    )
+  );
+  await sleep(500);
+  const entryCountAfterFolder = await evalIn(
+    cdp,
+    control.sessionId,
+    "chrome.storage.local.get(null).then((all) => Object.keys(all).filter((key) => key.startsWith('entry:')).length)"
+  );
+  await evalIn(
+    cdp,
+    hub.sessionId,
+    "document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))",
+    1
+  );
+  const dropdownClosed = await waitFor(() =>
+    evalIn(cdp, hub.sessionId, "!document.querySelector('[data-testid=\"bookmark-dropdown\"]')", 1)
+  );
+  check(
+    "m. folder dropdown renders link and Escape closes",
+    bookmarkDropdown?.title === "Hub Bookmark Search Result" && Boolean(dropdownClosed),
+    `link=${bookmarkDropdown?.title} closed=${Boolean(dropdownClosed)}`
+  );
+  await evalIn(
+    cdp,
+    hub.sessionId,
+    `document.querySelector('[data-testid=${JSON.stringify(`bookmark-folder-${bookmarkFixture.folderId}`)}]').click()`,
+    1
+  );
+  await waitFor(() =>
+    evalIn(
+      cdp,
+      hub.sessionId,
+      `Boolean(document.querySelector('[data-testid=${JSON.stringify(`bookmark-item-link-${bookmarkFixture.linkId}`)}]'))`,
+      1
+    )
+  );
+  await evalIn(
+    cdp,
+    hub.sessionId,
+    `document.querySelector('[data-testid=${JSON.stringify(`bookmark-item-link-${bookmarkFixture.linkId}`)}]').click()`,
+    1
+  );
+  const openedBookmarkTabs = await waitFor(() =>
+    evalIn(
+      cdp,
+      control.sessionId,
+      `chrome.tabs.query({ url: ${JSON.stringify(bookmarkUrl)} }).then((tabs) => tabs.length ? tabs.map((tab) => tab.id) : null)`,
+      1
+    )
+  );
+  check(
+    "n. bookmark dropdown link opens a new tab",
+    openedBookmarkTabs?.length > 0,
+    `tabs=${openedBookmarkTabs?.length ?? 0} url=${bookmarkUrl}`
+  );
+
+  await evalIn(
+    cdp,
+    hub.sessionId,
+    `(() => {
+      const input = document.querySelector('[data-testid="hub-search"]');
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+      setter.call(input, 'Hub Bookmark Search Result');
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    })()`,
+    1
+  );
+  const bookmarkSearchBand = await waitFor(() =>
+    evalIn(
+      cdp,
+      hub.sessionId,
+      `(() => {
+        const band = document.querySelector('[data-testid="band-bookmarks"]');
+        const row = document.querySelector('[data-testid=${JSON.stringify(`bookmark-search-${bookmarkFixture.linkId}`)}]');
+        const recent = document.querySelector('[data-testid="band-recent"]');
+        const later = document.querySelector('[data-testid="band-later"]');
+        return band && row && recent && later
+          ? {
+              count: Number(document.querySelector('[data-testid="band-count-bookmarks"]')?.textContent),
+              afterRecent: Boolean(recent.compareDocumentPosition(band) & Node.DOCUMENT_POSITION_FOLLOWING),
+              beforeLater: Boolean(band.compareDocumentPosition(later) & Node.DOCUMENT_POSITION_FOLLOWING),
+              actions: row.querySelectorAll('.row-actions').length,
+              heading: document.querySelector('[data-testid="band-toggle-bookmarks"]')?.textContent.trim(),
+              mark: row.querySelector('.bookmark-result-mark')?.textContent
+            }
+          : null;
+      })()`,
+      1
+    )
+  );
+  await evalIn(
+    cdp,
+    hub.sessionId,
+    "document.querySelector('[data-testid=\"band-toggle-bookmarks\"]')?.click()",
+    1
+  );
+  const bookmarkBandCollapsed = await waitFor(() =>
+    evalIn(
+      cdp,
+      hub.sessionId,
+      `document.querySelector('[data-testid="band-bookmarks"]')?.dataset.collapsed === 'true' && !document.querySelector('[data-testid="band-rows-bookmarks"]')`,
+      1
+    )
+  );
+  await evalIn(
+    cdp,
+    hub.sessionId,
+    `(() => {
+      const input = document.querySelector('[data-testid="hub-search"]');
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+      setter.call(input, '');
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    })()`,
+    1
+  );
+  const bookmarkBandAbsent = await waitFor(() =>
+    evalIn(cdp, hub.sessionId, "!document.querySelector('[data-testid=\"band-bookmarks\"]')", 1)
+  );
+  check(
+    "o. search shows an independent collapsible bookmark band",
+    bookmarkSearchBand?.count === 1 &&
+      bookmarkSearchBand.afterRecent === true &&
+      bookmarkSearchBand.beforeLater === true &&
+      bookmarkSearchBand.actions === 0 &&
+      bookmarkSearchBand.heading.includes("⭐") &&
+      bookmarkSearchBand.heading.includes(S.bookmarks.band) &&
+      bookmarkSearchBand.mark === "⭐" &&
+      Boolean(bookmarkBandCollapsed) &&
+      Boolean(bookmarkBandAbsent),
+    `state=${JSON.stringify(bookmarkSearchBand)} collapsed=${Boolean(bookmarkBandCollapsed)} absent=${Boolean(bookmarkBandAbsent)}`
+  );
+  check(
+    "p. bookmark reads do not mutate ledger entries",
+    entryCountAfterStrip === entryCountBeforeBookmarks && entryCountAfterFolder === entryCountBeforeBookmarks,
+    `before=${entryCountBeforeBookmarks} strip=${entryCountAfterStrip} folder=${entryCountAfterFolder}`
+  );
+
+  if (openedBookmarkTabs?.length) {
+    await evalIn(cdp, control.sessionId, `chrome.tabs.remove(${JSON.stringify(openedBookmarkTabs)})`);
+  }
+
   console.log(JSON.stringify({ ok: results.every((result) => result.ok), extensionId, results }, null, 2));
 } catch (error) {
   console.error(error);

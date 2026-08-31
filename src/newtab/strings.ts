@@ -32,6 +32,49 @@ export const S = {
     pdf: "PDF"
   },
 
+  /**
+   * Service sub-classification of web targets. These are the seed labels only —
+   * rules live in chrome.storage.local under `serviceRules` and grow over time,
+   * so auto-promoted services derive their label from the host instead.
+   */
+  service: {
+    sheet: "表計算",
+    doc: "文書",
+    drive: "ドライブ",
+    ai: "AI",
+    dev: "開発",
+    comm: "連絡",
+    internal: "社内",
+    search: "検索",
+    study: "学習",
+    media: "メディア",
+    shop: "買い物",
+    gov: "官庁",
+    other: "その他"
+  },
+
+  /** Group-level controls that appear on hover in the dense layout. */
+  group: {
+    collapse: "このまとまりを畳む",
+    expand: "このまとまりを開く",
+    closeAll: "このまとまりを全部閉じる",
+    closedToast: (name: string, n: number) => `「${name}」の ${n} 件を閉じた`,
+    /** Bucket that single-entry groups get folded into. */
+    misc: "その他"
+  },
+
+  /** Bookmark strip (bookmark_bar children) and the search-only bookmark band. */
+  bookmarks: {
+    lead: "ブックマーク",
+    /** title attribute on a folder chip. */
+    folderHint: (name: string, count: number) => `${name}（${count}件）`,
+    /** Band heading shown only while a search query is active. */
+    band: "ブックマーク",
+    empty: "ブックマークバーは空",
+    /** Breadcrumb back-link inside a nested folder dropdown. */
+    back: "戻る"
+  },
+
   /** Tab bar controls above the list. */
   tabs: {
     /** Screen-reader label for the kind filter tab strip. */

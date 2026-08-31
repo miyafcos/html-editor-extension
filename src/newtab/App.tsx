@@ -25,6 +25,7 @@ import { S } from "./strings";
 type Kind = ReportEntry["kind"];
 type KindFilter = "all" | Kind;
 type Band = "open" | "recent" | "later";
+type CollapsibleBand = Band | "bookmarks";
 
 interface HubEntry extends NewTabIndexEntry {
   tabId?: number;
@@ -41,12 +42,13 @@ interface ToastState {
 const KINDS: Kind[] = ["web", "html", "pdf"];
 const KIND_FILTERS: KindFilter[] = ["all", ...KINDS];
 const BANDS: Band[] = ["open", "recent", "later"];
+const COLLAPSIBLE_BANDS: CollapsibleBand[] = ["open", "recent", "bookmarks", "later"];
 const SILENT_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
 const LAYOUT_STORAGE_KEY = "tabhub:layout";
 
 interface LayoutState {
   kind: KindFilter;
-  collapsedBands: Band[];
+  collapsedBands: CollapsibleBand[];
 }
 
 function readLayoutState(): LayoutState {
@@ -55,7 +57,9 @@ function readLayoutState(): LayoutState {
     const stored = JSON.parse(localStorage.getItem(LAYOUT_STORAGE_KEY) ?? "null") as Partial<LayoutState> | null;
     if (!stored || !KIND_FILTERS.includes(stored.kind as KindFilter)) return fallback;
     const collapsedBands = Array.isArray(stored.collapsedBands)
-      ? stored.collapsedBands.filter((band): band is Band => BANDS.includes(band as Band))
+      ? stored.collapsedBands.filter((band): band is CollapsibleBand =>
+          COLLAPSIBLE_BANDS.includes(band as CollapsibleBand)
+        )
       : [];
     return { kind: stored.kind as KindFilter, collapsedBands: [...new Set(collapsedBands)] };
   } catch {
@@ -119,6 +123,191 @@ function kindIcon(kind: Kind): string {
 
 function faviconUrl(url: string): string {
   return chrome.runtime.getURL(`/_favicon/?pageUrl=${encodeURIComponent(url)}&size=32`);
+}
+
+function bookmarkBarChildren(tree: chrome.bookmarks.BookmarkTreeNode[]): chrome.bookmarks.BookmarkTreeNode[] {
+  const rootChildren = tree[0]?.children ?? [];
+  const bookmarkBar = rootChildren.find((node) => node.id === "1") ?? rootChildren.find((node) => !node.url);
+  return bookmarkBar?.children ?? [];
+}
+
+function flattenBookmarks(nodes: chrome.bookmarks.BookmarkTreeNode[]): chrome.bookmarks.BookmarkTreeNode[] {
+  return nodes.flatMap((node) => (node.url ? [node] : flattenBookmarks(node.children ?? [])));
+}
+
+function bookmarkSearchText(node: chrome.bookmarks.BookmarkTreeNode): string {
+  return `${node.title}\n${node.url ?? ""}`.toLowerCase().normalize("NFC");
+}
+
+function BookmarkStrip({
+  nodes,
+  onOpen
+}: {
+  nodes: chrome.bookmarks.BookmarkTreeNode[];
+  onOpen: (url: string) => void;
+}) {
+  const [openPath, setOpenPath] = useState<chrome.bookmarks.BookmarkTreeNode[]>([]);
+  const [menuLeft, setMenuLeft] = useState(0);
+  const stripRef = useRef<HTMLElement>(null);
+  const dropdownRef = useRef<HTMLDivElement>(null);
+  const openTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const focusDropdownRef = useRef(false);
+  const currentFolder = openPath.at(-1);
+
+  useEffect(() => {
+    if (!currentFolder) return;
+    const closeOutside = (event: PointerEvent) => {
+      if (!stripRef.current?.contains(event.target as Node)) setOpenPath([]);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        openTriggerRef.current?.focus();
+        setOpenPath([]);
+      }
+    };
+    document.addEventListener("pointerdown", closeOutside, true);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOutside, true);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [currentFolder]);
+
+  useEffect(() => {
+    if (!currentFolder || !focusDropdownRef.current) return;
+    focusDropdownRef.current = false;
+    dropdownRef.current?.querySelector("button")?.focus();
+  }, [currentFolder]);
+
+  const toggleFolder = (node: chrome.bookmarks.BookmarkTreeNode, button: HTMLButtonElement) => {
+    if (openPath[0]?.id === node.id) {
+      setOpenPath([]);
+      return;
+    }
+    const stripBox = stripRef.current?.getBoundingClientRect();
+    const buttonBox = button.getBoundingClientRect();
+    if (stripBox) setMenuLeft(Math.max(0, Math.min(buttonBox.left - stripBox.left, stripBox.width - 280)));
+    openTriggerRef.current = button;
+    setOpenPath([node]);
+  };
+
+  return (
+    <section className="bookmark-strip" data-testid="bookmark-strip" ref={stripRef}>
+      <h2><span aria-hidden="true">⭐</span> {S.bookmarks.lead}</h2>
+      <div className="bookmark-chips" data-testid="bookmark-chips">
+        {nodes.length ? (
+          nodes.map((node) =>
+            node.url ? (
+              <button
+                key={node.id}
+                type="button"
+                className="bookmark-chip bookmark-direct"
+                data-testid={`bookmark-direct-${node.id}`}
+                data-bookmark-id={node.id}
+                title={node.title || node.url}
+                onClick={() => onOpen(node.url!)}
+              >
+                <span>{node.title || node.url}</span>
+              </button>
+            ) : (
+              <button
+                key={node.id}
+                type="button"
+                className="bookmark-chip bookmark-folder"
+                data-testid={`bookmark-folder-${node.id}`}
+                data-bookmark-id={node.id}
+                title={S.bookmarks.folderHint(node.title, node.children?.length ?? 0)}
+                aria-expanded={openPath[0]?.id === node.id}
+                aria-controls={openPath[0]?.id === node.id ? "bookmark-dropdown" : undefined}
+                onClick={(event) => toggleFolder(node, event.currentTarget)}
+              >
+                <span>{node.title}</span>
+                <span className="bookmark-caret" aria-hidden="true">▾</span>
+              </button>
+            )
+          )
+        ) : (
+          <p>{S.bookmarks.empty}</p>
+        )}
+      </div>
+
+      {currentFolder && (
+        <div
+          className="bookmark-dropdown"
+          id="bookmark-dropdown"
+          data-testid="bookmark-dropdown"
+          role="region"
+          aria-label={currentFolder.title}
+          ref={dropdownRef}
+          style={{ left: menuLeft }}
+        >
+          {openPath.length > 1 && (
+            <button
+              type="button"
+              className="bookmark-dropdown-back"
+              data-testid="bookmark-back"
+              onClick={() => {
+                focusDropdownRef.current = true;
+                setOpenPath((current) => current.slice(0, -1));
+              }}
+            >
+              <span aria-hidden="true">‹</span>
+              <span>{S.bookmarks.back}</span>
+            </button>
+          )}
+          {(currentFolder.children ?? []).map((node) =>
+            node.url ? (
+              <button
+                key={node.id}
+                type="button"
+                className="bookmark-dropdown-link"
+                data-testid={`bookmark-item-link-${node.id}`}
+                onClick={() => {
+                  setOpenPath([]);
+                  onOpen(node.url!);
+                }}
+              >
+                <span>{node.title || node.url}</span>
+              </button>
+            ) : (
+              <button
+                key={node.id}
+                type="button"
+                data-testid={`bookmark-item-folder-${node.id}`}
+                onClick={() => {
+                  focusDropdownRef.current = true;
+                  setOpenPath((current) => [...current, node]);
+                }}
+              >
+                <span className="bookmark-dropdown-folder" aria-hidden="true">▸</span>
+                <span>{node.title}</span>
+              </button>
+            )
+          )}
+          {(currentFolder.children?.length ?? 0) === 0 && <p>{S.bookmarks.empty}</p>}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function BookmarkResult({ node, onOpen }: { node: chrome.bookmarks.BookmarkTreeNode; onOpen: (url: string) => void }) {
+  const url = node.url!;
+  return (
+    <button
+      type="button"
+      className="bookmark-result"
+      data-testid={`bookmark-search-${node.id}`}
+      data-bookmark-id={node.id}
+      onClick={() => onOpen(url)}
+    >
+      <span className="bookmark-result-mark" aria-hidden="true">⭐</span>
+      <span className="bookmark-result-copy">
+        <strong>{node.title || url}</strong>
+        <small>{url}</small>
+      </span>
+    </button>
+  );
 }
 
 function AppRow({
@@ -224,6 +413,7 @@ export function App() {
   const [index, setIndex] = useState<NewTabIndexEntry[]>([]);
   const [openTabs, setOpenTabs] = useState<HubEntry[]>([]);
   const [fullEntries, setFullEntries] = useState<NewTabIndexEntry[] | null>(null);
+  const [bookmarkNodes, setBookmarkNodes] = useState<chrome.bookmarks.BookmarkTreeNode[]>([]);
   const [query, setQuery] = useState("");
   const [toast, setToast] = useState<ToastState | null>(null);
   const [layout, setLayout] = useState<LayoutState>(readLayoutState);
@@ -247,6 +437,11 @@ export function App() {
         fullLoadRef.current = null;
       });
     return fullLoadRef.current;
+  }, []);
+
+  const loadBookmarks = useCallback(async () => {
+    const tree = await chrome.bookmarks.getTree();
+    setBookmarkNodes(bookmarkBarChildren(tree));
   }, []);
 
   const loadTabs = useCallback(async (currentSettings: Settings) => {
@@ -285,9 +480,9 @@ export function App() {
       await ensureSchemaV2();
       const currentSettings = await getSettings();
       setSettings(currentSettings);
-      await Promise.all([loadIndex(), loadTabs(currentSettings)]);
+      await Promise.all([loadIndex(), loadTabs(currentSettings), loadBookmarks()]);
     })();
-  }, [loadIndex, loadTabs]);
+  }, [loadBookmarks, loadIndex, loadTabs]);
 
   useEffect(() => {
     if (!settings) return;
@@ -309,6 +504,20 @@ export function App() {
       chrome.tabs.onUpdated.removeListener(tabHandler);
     };
   }, [loadIndex, loadTabs, settings]);
+
+  useEffect(() => {
+    const refreshBookmarks = () => void loadBookmarks();
+    chrome.bookmarks.onCreated.addListener(refreshBookmarks);
+    chrome.bookmarks.onChanged.addListener(refreshBookmarks);
+    chrome.bookmarks.onRemoved.addListener(refreshBookmarks);
+    chrome.bookmarks.onMoved.addListener(refreshBookmarks);
+    return () => {
+      chrome.bookmarks.onCreated.removeListener(refreshBookmarks);
+      chrome.bookmarks.onChanged.removeListener(refreshBookmarks);
+      chrome.bookmarks.onRemoved.removeListener(refreshBookmarks);
+      chrome.bookmarks.onMoved.removeListener(refreshBookmarks);
+    };
+  }, [loadBookmarks]);
 
   useEffect(() => {
     if (!query.trim() || fullEntries) return;
@@ -342,6 +551,12 @@ export function App() {
     const needle = query.trim().toLowerCase().normalize("NFC");
     return [...byKey.values()].filter((entry) => !needle || searchText(entry).includes(needle));
   }, [fullEntries, index, openTabs, query]);
+
+  const bookmarkEntries = useMemo(() => flattenBookmarks(bookmarkNodes), [bookmarkNodes]);
+  const bookmarkMatches = useMemo(() => {
+    const needle = query.trim().toLowerCase().normalize("NFC");
+    return needle ? bookmarkEntries.filter((node) => bookmarkSearchText(node).includes(needle)) : [];
+  }, [bookmarkEntries, query]);
 
   const openKeys = useMemo(() => new Set(openTabs.map((entry) => entry.key)), [openTabs]);
   const visibleByBand = useCallback(
@@ -470,30 +685,34 @@ export function App() {
       if (event.key !== "Enter") return;
       const text = query.trim();
       if (!text) return;
-      let hasMatch = merged.length > 0;
+      let hasMatch = merged.length > 0 || bookmarkMatches.length > 0;
       if (!fullEntries) {
         const needle = text.toLowerCase().normalize("NFC");
         const full = await loadFullEntries();
-        hasMatch = [...full, ...openTabs].some((entry) => searchText(entry).includes(needle));
+        hasMatch = hasMatch || [...full, ...openTabs].some((entry) => searchText(entry).includes(needle));
       }
       if (!hasMatch) {
         await chrome.search.query({ text, disposition: "CURRENT_TAB" });
       }
     },
-    [fullEntries, loadFullEntries, merged.length, openTabs, query]
+    [bookmarkMatches.length, fullEntries, loadFullEntries, merged.length, openTabs, query]
   );
 
   const selectKind = useCallback((kind: KindFilter) => {
     setLayout((current) => ({ ...current, kind }));
   }, []);
 
-  const toggleBand = useCallback((band: Band) => {
+  const toggleBand = useCallback((band: CollapsibleBand) => {
     setLayout((current) => {
       const collapsed = new Set(current.collapsedBands);
       if (collapsed.has(band)) collapsed.delete(band);
       else collapsed.add(band);
-      return { ...current, collapsedBands: BANDS.filter((item) => collapsed.has(item)) };
+      return { ...current, collapsedBands: COLLAPSIBLE_BANDS.filter((item) => collapsed.has(item)) };
     });
+  }, []);
+
+  const openBookmark = useCallback(async (url: string) => {
+    await chrome.tabs.create({ url, active: true });
   }, []);
 
   const runTabstripAction = useCallback(async (action: "collapse-hub-tabs" | "expand-hub-tabs") => {
@@ -523,6 +742,48 @@ export function App() {
 
   const pinned = merged.filter((entry) => entry.pinned || entry.chromePinned);
   const ledgerCount = (query.trim() && fullEntries ? fullEntries : index).length;
+  const renderLedgerBand = (band: Band) => {
+    const rows = rowsByBand[band];
+    const collapsed = layout.collapsedBands.includes(band);
+    return (
+      <section
+        className="band"
+        key={band}
+        data-testid={`band-${band}`}
+        data-collapsed={collapsed ? "true" : "false"}
+      >
+        <h3>
+          <button
+            type="button"
+            data-testid={`band-toggle-${band}`}
+            title={collapsed ? S.band.expand : S.band.collapse}
+            aria-expanded={!collapsed}
+            onClick={() => toggleBand(band)}
+          >
+            <span aria-hidden="true">{collapsed ? "▸" : "▾"}</span>
+            <span>{S.band[band]}</span>
+            <span className="band-count" data-testid={`band-count-${band}`}>{rows.length}</span>
+          </button>
+        </h3>
+        {!collapsed && rows.length > 0 && (
+          <div className="band-rows" data-testid={`band-rows-${band}`}>
+            {rows.map((entry) => (
+              <AppRow
+                key={`${band}-${entry.id}`}
+                entry={entry}
+                band={band}
+                showKindIcon={layout.kind === "all"}
+                onOpen={(item, itemBand) => void openEntry(item, itemBand)}
+                onLater={(item) => void moveLater(item)}
+                onPin={(item) => void togglePin(item)}
+                onRemove={(item) => void removeEntry(item)}
+              />
+            ))}
+          </div>
+        )}
+      </section>
+    );
+  };
 
   return (
     <main className="hub-shell" data-testid="hub-shell" data-ready={settings ? "true" : "false"}>
@@ -548,7 +809,9 @@ export function App() {
             </button>
           )}
         </label>
-        {query.trim() && merged.length === 0 && <p className="search-hint">{S.search.fallbackHint}</p>}
+        {query.trim() && merged.length === 0 && bookmarkMatches.length === 0 && (
+          <p className="search-hint">{S.search.fallbackHint}</p>
+        )}
       </header>
 
       <section className="pinned-strip" data-testid="pinned-strip">
@@ -572,7 +835,9 @@ export function App() {
         </div>
       </section>
 
-      {index.length === 0 && openTabs.length === 0 ? (
+      <BookmarkStrip nodes={bookmarkNodes} onOpen={(url) => void openBookmark(url)} />
+
+      {index.length === 0 && openTabs.length === 0 && !query.trim() ? (
         <section className="first-run">
           <span aria-hidden="true">⌁</span>
           <h2>{S.firstRun.heading}</h2>
@@ -626,49 +891,37 @@ export function App() {
           </div>
 
           <div className="band-list">
-            {BANDS.map((band) => {
-              const rows = rowsByBand[band];
-              const collapsed = layout.collapsedBands.includes(band);
-              return (
-                <section
-                  className="band"
-                  key={band}
-                  data-testid={`band-${band}`}
-                  data-collapsed={collapsed ? "true" : "false"}
-                >
-                  <h3>
-                    <button
-                      type="button"
-                      data-testid={`band-toggle-${band}`}
-                      title={collapsed ? S.band.expand : S.band.collapse}
-                      aria-expanded={!collapsed}
-                      onClick={() => toggleBand(band)}
-                    >
-                      <span aria-hidden="true">{collapsed ? "▸" : "▾"}</span>
-                      <span>{S.band[band]}</span>
-                      <span className="band-count" data-testid={`band-count-${band}`}>{rows.length}</span>
-                    </button>
-                  </h3>
-                  {!collapsed && rows.length > 0 && (
-                    <div className="band-rows" data-testid={`band-rows-${band}`}>
-                      {rows.map((entry) => (
-                        <AppRow
-                          key={`${band}-${entry.id}`}
-                          entry={entry}
-                          band={band}
-                          showKindIcon={layout.kind === "all"}
-                          onOpen={(item, itemBand) => void openEntry(item, itemBand)}
-                          onLater={(item) => void moveLater(item)}
-                          onPin={(item) => void togglePin(item)}
-                          onRemove={(item) => void removeEntry(item)}
-                        />
-                      ))}
-                    </div>
-                  )}
-                </section>
-              );
-            })}
-            {filteredEntries.length === 0 && (
+            {(["open", "recent"] as Band[]).map(renderLedgerBand)}
+            {query.trim() && bookmarkMatches.length > 0 && (
+              <section
+                className="band bookmark-search-band"
+                data-testid="band-bookmarks"
+                data-collapsed={layout.collapsedBands.includes("bookmarks") ? "true" : "false"}
+              >
+                <h3>
+                  <button
+                    type="button"
+                    data-testid="band-toggle-bookmarks"
+                    title={layout.collapsedBands.includes("bookmarks") ? S.band.expand : S.band.collapse}
+                    aria-expanded={!layout.collapsedBands.includes("bookmarks")}
+                    onClick={() => toggleBand("bookmarks")}
+                  >
+                    <span aria-hidden="true">{layout.collapsedBands.includes("bookmarks") ? "▸" : "▾"}</span>
+                    <span><span aria-hidden="true">⭐</span> {S.bookmarks.band}</span>
+                    <span className="band-count" data-testid="band-count-bookmarks">{bookmarkMatches.length}</span>
+                  </button>
+                </h3>
+                {!layout.collapsedBands.includes("bookmarks") && (
+                  <div className="band-rows" data-testid="band-rows-bookmarks">
+                    {bookmarkMatches.map((node) => (
+                      <BookmarkResult key={node.id} node={node} onOpen={(url) => void openBookmark(url)} />
+                    ))}
+                  </div>
+                )}
+              </section>
+            )}
+            {renderLedgerBand("later")}
+            {filteredEntries.length === 0 && bookmarkMatches.length === 0 && (
               <p className="empty-list" data-testid="empty-filtered">
                 {S.empty.filtered(S.kind[layout.kind])}
               </p>

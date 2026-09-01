@@ -61,7 +61,6 @@ Any change will be published in this file with an updated date at the top.
 
 ## Contact
 
-<!-- TODO: 公開前に連絡先メールアドレスを記入する。Chrome Web Store のデベロッパー登録に使うアドレスと一致させること。 -->
 Contact: (to be filled in before publication)
 
 ---

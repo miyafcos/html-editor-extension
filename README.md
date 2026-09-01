@@ -31,7 +31,8 @@ E2E: `scratchpad/report-hub-e2e/e2e-merged.mjs` (CDP・22項目。Chrome for Tes
 ## 開発
 
 ```powershell
-cd C:\Users\miyaz\html-editor-extension
+git clone https://github.com/miyafcos/html-editor-extension.git
+cd html-editor-extension
 npm install
 npm run dev      # HMR 開発(dist/ に出力)
 npm run build    # 本番ビルド
@@ -42,7 +43,7 @@ npm run build    # 本番ビルド
 1. `npm run build`
 2. Chrome で `chrome://extensions` を開く
 3. 右上の「デベロッパーモード」を ON
-4. 「パッケージ化されていない拡張機能を読み込む」→ `C:\Users\miyaz\html-editor-extension\dist` を指定
+4. 「パッケージ化されていない拡張機能を読み込む」→ クローンしたリポジトリの `dist` フォルダを指定
 5. 拡張アイコンをクリック → エディタタブが開く
 6. 「開く」で `.html` ファイルを選ぶ → 編集 → `Ctrl+S` で上書き保存
 

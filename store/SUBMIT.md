@@ -7,7 +7,7 @@
 ## 提出パッケージ
 
 ```
-C:\Users\miyaz\html-editor-extension\release\HTMLHub_v0.15.1_20260901.zip
+release/HTMLHub_v0.15.1_20260901.zip
 ```
 
 - 142.6 KB / 35 エントリ
@@ -16,35 +16,42 @@ C:\Users\miyaz\html-editor-extension\release\HTMLHub_v0.15.1_20260901.zip
 
 > **注意:** PowerShell 5.1 の `Compress-Archive` はパス区切りに `\` を使う。
 > Chrome Web Store はこれを読めないため、再作成するときは
-> `scripts/` の python 版（`zipfile` + `as_posix()`）を使うこと。
+> `scripts/mkzip.py`（`zipfile` + `as_posix()`）を使うこと。
 
 再ビルドから作り直す場合:
 
 ```
 npm run build
-python <mkzip.py>   # dist/ の中身をルートにして zip 化
+python scripts/mkzip.py
 ```
+
+`manifest.json` がルートにあることと、区切りが `/` であることを自分で検証してから
+終了する。
 
 ---
 
-## 提出前に決めておくこと（未確定）
+## 提出前に決めておくこと
 
 | # | 項目 | 状態 |
 |---|---|---|
-| 1 | プライバシーポリシーの公開 URL | **未確定** — リポジトリが private のため現在の URL は 404 |
-| 2 | デベロッパー登録の連絡先メール | **未確定** — ストア上で公開される |
-| 3 | 公開範囲（一般公開 / 限定公開） | **未確定** |
+| 1 | プライバシーポリシーの公開 URL | **確定** — リポジトリを public 化し `https://github.com/miyafcos/html-editor-extension/blob/master/PRIVACY.md` を使う |
+| 2 | デベロッパー登録の連絡先メール | **未確定** — 本名を含まないアドレスを新規作成する |
+| 3 | 公開範囲 | **確定** — 一般公開（Public） |
 | 4 | 拡張機能名（ストア表示名 = manifest の `name`） | 現行「HTML Hub — 編集 + レポート管理」のまま可 |
 | 5 | スクリーンショット 1280×800 | **未撮影** — ダミーデータで撮ること |
 
 ### 1 について
 
-プライバシーポリシーは審査時に**誰でも開ける URL** である必要がある。選択肢:
+2026-09-01 に A（リポジトリの public 化）を採用。
 
-- **A. リポジトリを public にする** — `PRIVACY.md` の blob URL がそのまま使える。
-  審査官がソースも読めるので審査が速い。ただしコード全体が公開される。
-- **B. public な Gist に置く** — リポジトリは private のまま。URL は Gist のもの。
-- **C. GitHub Pages** — `docs/` を公開。リポジトリ自体は public 化が必要（Free プランの場合）。
+public 化にあたって走査した結果:
+
+- クライアント名・メールアドレス・案件名の露出は **ゼロ**
+- `src/reporthub/types.ts` などにある `G:/マイドライブ/...` はグループ推定の既定
+  ルールで、案件名はプレースホルダー（「案件X」）
+- README のローカルパスは汎用化済み
+- `e2e/*.mjs` には開発機の絶対パス（Chrome for Testing の場所など）が残る。
+  テスト実行に必要なもので機密ではないため、そのままにしてある
 
 ---
 
@@ -86,9 +93,11 @@ python <mkzip.py>   # dist/ の中身をルートにして zip 化
 
 ### Step 5 — Distribution（公開範囲）
 
-- **一般公開（Public）** — 検索に出る。単一目的ポリシーの審査が厳しい
-- **限定公開（Unlisted）** — 検索に出ない。URL を知っている人だけ入れる
-- **非公開（Private）** — 指定したアカウントのみ
+**一般公開（Public）を選ぶ**（2026-09-01 決定）。検索に出る。単一目的ポリシーの審査が
+一番厳しい枠なので、`store/justifications.md` の Single purpose description をそのまま
+使うこと。
+
+（参考: 限定公開 = 検索に出ず URL を知る人だけ / 非公開 = 指定アカウントのみ）
 
 対象地域は「すべての地域」で問題ない。
 

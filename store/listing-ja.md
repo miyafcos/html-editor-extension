@@ -90,7 +90,7 @@ Ctrl+Shift+8 — 畳んだグループを開き直します。
 拡張機能を削除すれば、保存されていたものも消えます。
 
 プライバシーポリシー:
-https://github.com/miyafcos/html-editor-extension/blob/main/PRIVACY.md
+https://github.com/miyafcos/html-editor-extension/blob/master/PRIVACY.md
 
 
 ■ 使い方
@@ -129,8 +129,8 @@ https://github.com/miyafcos/html-editor-extension
 ## 公開範囲
 
 ```
-限定公開（Unlisted） or 一般公開（Public）
+一般公開（Public）
 ```
 
-一般公開を選ぶ場合、審査は単一目的ポリシーを厳しく見る。
+一般公開は審査が単一目的ポリシーを一番厳しく見る枠。
 `store/justifications.md` の「Single purpose description」をそのまま提出欄に入れること。

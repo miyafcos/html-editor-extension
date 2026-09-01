@@ -61,7 +61,7 @@ Any change will be published in this file with an updated date at the top.
 
 ## Contact
 
-Contact: (to be filled in before publication)
+Contact: miyazaki.fcos@gmail.com
 
 ---
 
@@ -128,4 +128,4 @@ Chrome から拡張機能を削除すると、保存されていた情報はす�
 
 ## 連絡先
 
-連絡先: （公開前に記入）
+連絡先: miyazaki.fcos@gmail.com

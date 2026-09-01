@@ -58,7 +58,7 @@ async function evaluate(cdp, sessionId, expression) {
   return result.result?.value;
 }
 
-async function waitFor(check, timeoutMs = 15_000, intervalMs = 50) {
+async function waitFor(check, timeoutMs = 25_000, intervalMs = 50) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const value = await check();
@@ -111,6 +111,10 @@ async function capture(cdp, sessionId, name) {
 
 function chromeArgs() {
   return [
+    // Headless keeps the window off-screen. A visible window steals focus when
+    // Page.bringToFront runs, and whatever the operator types lands in the hub's
+    // autofocused search box, silently filtering the catalog in the screenshot.
+    "--headless=new",
     `--user-data-dir=${PROFILE}`,
     `--load-extension=${DIST}`,
     "--disable-features=DisableLoadExtensionCommandLineSwitch",
@@ -173,10 +177,10 @@ const BOOKMARKS = [
   { title: "GitHub", url: "https://github.com/" },
   { title: "YouTube", url: "https://www.youtube.com/" },
   { title: "Notion", url: "https://www.notion.so/" },
-  { title: "Slack", url: "https://app.slack.com/" },
+  { title: "Slack", url: "https://slack.com/" },
   { title: "Figma", url: "https://www.figma.com/" },
   { title: "Amazon", url: "https://www.amazon.co.jp/" },
-  { title: "Apple", url: "https://www.apple.com/jp/" }
+  { title: "Apple", url: "https://www.apple.com/" }
 ];
 
 function storageRecord(entries, now) {
@@ -202,11 +206,44 @@ async function openHub(cdp) {
 }
 
 async function hoverEntry(cdp, sessionId, id) {
-  const point = await waitFor(() => evaluate(cdp, sessionId, `(() => {
-    const rect = document.querySelector('[data-entry-id=${JSON.stringify(id)}]')?.getBoundingClientRect();
-    return rect && rect.width > 0 && rect.height > 0 ? { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 } : null;
-  })()`));
-  await cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: point.x, y: point.y }, sessionId);
+  // The hub opens the preview from onMouseOver and from onFocus, both on the shell
+  // element. Synthesised CDP mouse moves did not reach the React handler here, so
+  // drive it directly: focus the row's own control and dispatch a bubbling
+  // mouseover, which is what the delegated handler actually listens for.
+  await cdp.send("Page.bringToFront", {}, sessionId);
+  await evaluate(cdp, sessionId, `(() => {
+    const row = document.querySelector('[data-entry-id=${JSON.stringify(id)}]');
+    if (!row) return false;
+    const control = row.matches('a, button, [tabindex]') ? row : row.querySelector('a, button, [tabindex]');
+    const target = control ?? row;
+    target.focus?.();
+    target.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, cancelable: true, view: window }));
+    target.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, cancelable: true, view: window }));
+    return true;
+  })()`);
+}
+
+async function warmFavicons(cdp, urls) {
+  // The lookup is keyed on the exact page URL, not the origin, so visiting only
+  // https://mail.google.com leaves .../mail/u/0/#inbox without an icon. Visit the
+  // same URLs the fixtures use.
+  const targets = [...new Set(urls.map((url) => url.split("#")[0]))];
+  for (const origin of targets) {
+    let tab = null;
+    try {
+      tab = await createTarget(cdp, origin);
+      await waitFor(() => evaluate(cdp, tab.sessionId,
+        `Boolean(document.querySelector('link[rel~="icon"]')) || document.readyState === 'complete'`), 8_000);
+      await sleep(3_000);
+      console.log(`  favicon ${origin}`);
+    } catch {
+      console.log(`  favicon ${origin} (skipped)`);
+    } finally {
+      if (tab) {
+        try { await cdp.send("Target.closeTarget", { targetId: tab.targetId }); } catch { /* already gone */ }
+      }
+    }
+  }
 }
 
 async function main() {
@@ -276,28 +313,28 @@ th{background:#f2f7fa;font-weight:600}
     const entries = [
       // Well-known services everyone recognises, so the screenshots read the same
       // way for a reviewer in any country. Nothing here is real user data.
-      fixtureEntry({ id: "svc-gmail", url: "https://mail.google.com/mail/u/0/#inbox", title: "Gmail — 受信トレイ", group: "Google", kind: "web", service: "google", at: now, pinned: true }),
-      fixtureEntry({ id: "svc-drive", url: "https://drive.google.com/drive/my-drive", title: "Google ドライブ", group: "Google", kind: "web", service: "google", at: now - 1_000 }),
-      fixtureEntry({ id: "svc-calendar", url: "https://calendar.google.com/calendar/u/0/r", title: "Google カレンダー", group: "Google", kind: "web", service: "google", at: now - 2_000 }),
-      fixtureEntry({ id: "svc-docs", url: "https://docs.google.com/document/u/0/", title: "Google ドキュメント", group: "Google", kind: "web", service: "google", at: now - 3_000 }),
-      fixtureEntry({ id: "svc-maps", url: "https://www.google.com/maps", title: "Google マップ", group: "Google", kind: "web", service: "google", at: now - 4_000 }),
+      fixtureEntry({ id: "svc-gmail", url: "https://mail.google.com/", title: "Gmail", group: "Google", kind: "web", service: "google", at: now, pinned: true }),
+      fixtureEntry({ id: "svc-drive", url: "https://drive.google.com/", title: "Google ドライブ", group: "Google", kind: "web", service: "google", at: now - 1_000 }),
+      fixtureEntry({ id: "svc-calendar", url: "https://calendar.google.com/", title: "Google カレンダー", group: "Google", kind: "web", service: "google", at: now - 2_000 }),
+      fixtureEntry({ id: "svc-docs", url: "https://docs.google.com/", title: "Google ドキュメント", group: "Google", kind: "web", service: "google", at: now - 3_000 }),
+      fixtureEntry({ id: "svc-maps", url: "https://www.google.com/", title: "Google 検索", group: "Google", kind: "web", service: "google", at: now - 4_000 }),
 
       fixtureEntry({ id: "svc-github", url: "https://github.com/", title: "GitHub", group: "開発", kind: "web", service: "github", at: now - 5_000, pinned: true }),
-      fixtureEntry({ id: "svc-pulls", url: "https://github.com/pulls", title: "GitHub — プルリクエスト", group: "開発", kind: "web", service: "github", at: now - 6_000 }),
-      fixtureEntry({ id: "svc-so", url: "https://stackoverflow.com/questions", title: "Stack Overflow", group: "開発", kind: "web", service: "other", at: now - 7_000 }),
-      fixtureEntry({ id: "svc-mdn", url: "https://developer.mozilla.org/ja/", title: "MDN Web Docs", group: "開発", kind: "web", service: "other", at: now - 8_000 }),
-      fixtureEntry({ id: "svc-figma", url: "https://www.figma.com/files", title: "Figma — ファイル一覧", group: "開発", kind: "web", service: "other", at: now - 9_000 }),
+      fixtureEntry({ id: "svc-zenn", url: "https://zenn.dev/", title: "Zenn", group: "開発", kind: "web", service: "other", at: now - 6_000 }),
+      fixtureEntry({ id: "svc-so", url: "https://stackoverflow.com/", title: "Stack Overflow", group: "開発", kind: "web", service: "other", at: now - 7_000 }),
+      fixtureEntry({ id: "svc-mdn", url: "https://developer.mozilla.org/", title: "MDN Web Docs", group: "開発", kind: "web", service: "other", at: now - 8_000 }),
+      fixtureEntry({ id: "svc-figma", url: "https://www.figma.com/", title: "Figma", group: "開発", kind: "web", service: "other", at: now - 9_000 }),
 
-      fixtureEntry({ id: "svc-slack", url: "https://app.slack.com/client", title: "Slack", group: "仕事", kind: "web", service: "other", at: now - 10_000 }),
+      fixtureEntry({ id: "svc-slack", url: "https://slack.com/", title: "Slack", group: "仕事", kind: "web", service: "other", at: now - 10_000 }),
       fixtureEntry({ id: "svc-notion", url: "https://www.notion.so/", title: "Notion", group: "仕事", kind: "web", service: "other", at: now - 11_000 }),
-      fixtureEntry({ id: "svc-zoom", url: "https://zoom.us/meeting", title: "Zoom — ミーティング", group: "仕事", kind: "web", service: "other", at: now - 12_000 }),
-      fixtureEntry({ id: "svc-dropbox", url: "https://www.dropbox.com/home", title: "Dropbox", group: "仕事", kind: "web", service: "other", at: now - 13_000 }),
-      fixtureEntry({ id: "svc-trello", url: "https://trello.com/boards", title: "Trello — ボード", group: "仕事", kind: "web", service: "other", at: now - 14_000 }),
+      fixtureEntry({ id: "svc-zoom", url: "https://zoom.us/", title: "Zoom", group: "仕事", kind: "web", service: "other", at: now - 12_000 }),
+      fixtureEntry({ id: "svc-dropbox", url: "https://www.dropbox.com/", title: "Dropbox", group: "仕事", kind: "web", service: "other", at: now - 13_000 }),
+      fixtureEntry({ id: "svc-trello", url: "https://trello.com/", title: "Trello", group: "仕事", kind: "web", service: "other", at: now - 14_000 }),
 
       fixtureEntry({ id: "svc-youtube", url: "https://www.youtube.com/", title: "YouTube", group: "よく見る", kind: "web", service: "other", at: now - 15_000 }),
-      fixtureEntry({ id: "svc-x", url: "https://x.com/home", title: "X", group: "よく見る", kind: "web", service: "other", at: now - 16_000 }),
+      fixtureEntry({ id: "svc-x", url: "https://x.com/", title: "X", group: "よく見る", kind: "web", service: "other", at: now - 16_000 }),
       fixtureEntry({ id: "svc-amazon", url: "https://www.amazon.co.jp/", title: "Amazon", group: "よく見る", kind: "web", service: "other", at: now - 17_000 }),
-      fixtureEntry({ id: "svc-apple", url: "https://www.apple.com/jp/", title: "Apple", group: "よく見る", kind: "web", service: "other", at: now - 18_000 }),
+      fixtureEntry({ id: "svc-apple", url: "https://www.apple.com/", title: "Apple", group: "よく見る", kind: "web", service: "other", at: now - 18_000 }),
       fixtureEntry({ id: "svc-wikipedia", url: "https://ja.wikipedia.org/", title: "Wikipedia", group: "よく見る", kind: "web", service: "other", at: now - 19_000 }),
 
       // Local HTML is what the extension is actually for, so it gets the most rows.
@@ -319,6 +356,12 @@ th{background:#f2f7fa;font-weight:600}
       fixtureEntry({ id: "local-build", url: "http://localhost:4173/report.html", title: "ビルド後の確認", group: "localhost", kind: "web", service: "other", at: now - 33_000 }),
       fixtureEntry({ id: "local-story", url: "http://localhost:6006/", title: "コンポーネントの一覧", group: "localhost", kind: "web", service: "other", at: now - 34_000 })
     ];
+    console.log("warming favicon cache");
+    await warmFavicons(cdp, [
+      ...entries.filter((entry) => entry.url.startsWith("https://")).map((entry) => entry.url),
+      ...BOOKMARKS.map((bookmark) => bookmark.url)
+    ]);
+
     await evaluate(cdp, control.sessionId, `(async () => {
       await chrome.storage.local.clear();
       await chrome.storage.session.clear();
@@ -340,6 +383,16 @@ th{background:#f2f7fa;font-weight:600}
     })()`);
 
     const catalog = await openHub(cdp);
+    // The search box autofocuses, so a stray keystroke can leave the catalog filtered.
+    // Start every run from a cleared box.
+    await evaluate(cdp, catalog.sessionId, `(() => {
+      const input = document.querySelector('[data-testid="hub-search"]');
+      if (!input || !input.value) return true;
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+      setter.call(input, '');
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      return true;
+    })()`);
     await waitFor(() => evaluate(cdp, catalog.sessionId,
       "document.querySelectorAll('[data-entry-id]').length >= 35 && document.querySelectorAll('.hub-group').length >= 5"));
     await settle(cdp, catalog.sessionId);
@@ -363,15 +416,17 @@ th{background:#f2f7fa;font-weight:600}
       input.dispatchEvent(new Event('input', { bubbles: true }));
     })()`);
     await waitFor(() => evaluate(cdp, catalog.sessionId, "document.querySelectorAll('[data-entry-id]').length >= 35"));
-    await hoverEntry(cdp, catalog.sessionId, "doc-weekly");
-    await waitFor(() => evaluate(cdp, catalog.sessionId, `(() => {
+    await waitFor(async () => {
+      await hoverEntry(cdp, catalog.sessionId, "doc-weekly");
+      return evaluate(cdp, catalog.sessionId, `(() => {
       const card = document.querySelector('[data-testid="preview-card"]');
       if (card?.dataset.previewEntryId !== 'doc-weekly') return false;
       if (!document.querySelector('[data-testid="preview-excerpt"]')) return false;
       const style = getComputedStyle(card);
       // The card fades in; capturing before it is fully opaque bleeds the list through it.
       return Number(style.opacity) === 1 && style.visibility === 'visible';
-    })()`));
+    })()`);
+    }, 25_000, 600);
     await settle(cdp, catalog.sessionId);
     await capture(cdp, catalog.sessionId, "03-preview.png");
 

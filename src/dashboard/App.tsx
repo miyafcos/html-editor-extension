@@ -185,7 +185,7 @@ export default function App() {
   return (
     <div className={css.app}>
       <header className={css.header}>
-        <div className={css.brand}>Report Hub</div>
+        <div className={css.brand}>HTML Hub</div>
         <nav className={css.nav}>
           <button
             className={view === "library" ? css.navActive : ""}

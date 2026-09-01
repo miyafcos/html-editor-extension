@@ -249,3 +249,107 @@ export function addSkip(result: OperationResult, reason: string, count = 1): voi
 export function addFailure(result: OperationResult, tabId: number, reason: string): void {
   result.failed.push({ tabId, reason });
 }
+
+export const HUB_GROUP_TITLE_PREFIX = "Hub · ";
+
+const HUB_GROUP_TITLES: Record<HubKind, string> = {
+  web: "Web",
+  html: "HTML",
+  pdf: "PDF"
+};
+
+export function hubGroupTitle(kind: HubKind): string {
+  return `${HUB_GROUP_TITLE_PREFIX}${HUB_GROUP_TITLES[kind]}`;
+}
+
+export function parseHubGroupTitle(title: string | undefined): HubKind | null {
+  for (const kind of Object.keys(HUB_GROUP_TITLES) as HubKind[]) {
+    if (title === hubGroupTitle(kind)) return kind;
+  }
+  return null;
+}
+
+export interface HubGroupRegistry {
+  readonly groups: Readonly<Partial<Record<HubKind, number>>>;
+  readonly lastOrganizedAt: Readonly<Partial<Record<HubKind, number>>>;
+}
+
+export function ownedGroupIds(registry: HubGroupRegistry): Set<number> {
+  return new Set(Object.values(registry.groups).filter((groupId): groupId is number => groupId != null));
+}
+
+export function reconcileRegistry(
+  registry: HubGroupRegistry,
+  liveGroups: readonly { id: number; title?: string; collapsed: boolean }[]
+): { registry: HubGroupRegistry; dropped: { kind: HubKind; groupId: number; reason: string }[] } {
+  const liveGroupsById = new Map(liveGroups.map((group) => [group.id, group]));
+  const groups: Partial<Record<HubKind, number>> = {};
+  const lastOrganizedAt: Partial<Record<HubKind, number>> = {};
+  const dropped: { kind: HubKind; groupId: number; reason: string }[] = [];
+
+  for (const kind of Object.keys(HUB_GROUP_TITLES) as HubKind[]) {
+    const groupId = registry.groups[kind];
+    if (groupId == null) continue;
+    const liveGroup = liveGroupsById.get(groupId);
+    if (!liveGroup) {
+      dropped.push({ kind, groupId, reason: "gone" });
+      continue;
+    }
+    if (liveGroup.title !== hubGroupTitle(kind)) {
+      dropped.push({ kind, groupId, reason: "renamed" });
+      continue;
+    }
+    groups[kind] = groupId;
+    const organizedAt = registry.lastOrganizedAt[kind];
+    if (organizedAt != null) lastOrganizedAt[kind] = organizedAt;
+  }
+
+  return { registry: { groups, lastOrganizedAt }, dropped };
+}
+
+export interface GroupAssignmentTab {
+  id: number;
+  url: string;
+  pinned: boolean;
+  groupId: number;
+}
+
+export function planGroupAssignment(
+  tabs: readonly GroupAssignmentTab[],
+  ctx: { hubTabId: number; registry: HubGroupRegistry; kindScope: HubKind | "all" }
+): { assign: Record<HubKind, number[]>; skipped: { tabId: number; reason: string }[] } {
+  const assign: Record<HubKind, number[]> = { web: [], html: [], pdf: [] };
+  const skipped: { tabId: number; reason: string }[] = [];
+  const ownedIds = ownedGroupIds(ctx.registry);
+
+  for (const tab of tabs) {
+    if (tab.pinned) {
+      skipped.push({ tabId: tab.id, reason: "pinned" });
+      continue;
+    }
+    if (tab.id === ctx.hubTabId) {
+      skipped.push({ tabId: tab.id, reason: "hub-tab" });
+      continue;
+    }
+    const kind = classifyKind(tab.url);
+    if (!kind) {
+      skipped.push({ tabId: tab.id, reason: "unsupported" });
+      continue;
+    }
+    if (ctx.kindScope !== "all" && kind !== ctx.kindScope) {
+      skipped.push({ tabId: tab.id, reason: "out-of-scope" });
+      continue;
+    }
+    if (tab.groupId !== TAB_GROUP_ID_NONE && !ownedIds.has(tab.groupId)) {
+      skipped.push({ tabId: tab.id, reason: "foreign-group" });
+      continue;
+    }
+    if (tab.groupId === ctx.registry.groups[kind]) {
+      skipped.push({ tabId: tab.id, reason: "already" });
+      continue;
+    }
+    assign[kind].push(tab.id);
+  }
+
+  return { assign, skipped };
+}

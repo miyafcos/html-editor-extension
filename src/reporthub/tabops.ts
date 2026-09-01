@@ -1,6 +1,17 @@
 import type { Settings, UndoSnapshot } from "./types";
-import type { NormalizedFile, NormalizedTarget } from "./url";
-import { isTargetFile, normalizeFileUrl, normalizeTarget } from "./url";
+import type { NormalizedFile } from "./url";
+import { isTargetFile, normalizeFileUrl } from "./url";
+import type { HubGroupRegistry, HubKind, OperationResult } from "./tabpolicy";
+import {
+  addChanged,
+  addFailure,
+  addSkip,
+  emptyResult,
+  hubGroupTitle,
+  planGroupAssignment,
+  reconcileRegistry
+} from "./tabpolicy";
+import { loadRegistry, markOrganized, saveRegistry } from "./tabgroups";
 
 /** storage.local key for the やりなおし (undo) snapshot of the last close op. */
 export const UNDO_KEY = "undo:lastClosed";
@@ -171,64 +182,110 @@ async function groupTabIdsByLabel(
   if (collapse) await collapseGroup(groupId, windowId);
 }
 
-type HubKind = NormalizedTarget["kind"];
-
 const HUB_GROUPS: Record<
   HubKind,
-  { title: string; color: chrome.tabGroups.ColorEnum }
+  { color: chrome.tabGroups.ColorEnum }
 > = {
-  web: { title: "Web", color: "blue" },
-  html: { title: "HTML", color: "green" },
-  pdf: { title: "PDF", color: "red" }
+  web: { color: "blue" },
+  html: { color: "green" },
+  pdf: { color: "red" }
 };
 
 /** Group every supported tab in the hub's window by kind and collapse each group. */
 export async function collapseHubTabs(
-  settings: Settings,
+  _settings: Settings,
   windowId: number,
-  hubTabId: number
-): Promise<number> {
-  const byKind: Record<HubKind, number[]> = { web: [], html: [], pdf: [] };
-  const tabs = await chrome.tabs.query({ windowId });
-  for (const tab of tabs) {
-    if (tab.id == null || tab.id === hubTabId || tab.pinned) continue;
-    const norm = normalizeTarget(tab.url, settings);
-    if (norm) byKind[norm.kind].push(tab.id);
-  }
+  hubTabId: number,
+  kindScope: HubKind | "all" = "all"
+): Promise<OperationResult> {
+  const result = emptyResult();
+  const liveGroups = await chrome.tabGroups.query({ windowId });
+  const liveGroupsById = new Map(liveGroups.map((group) => [group.id, group]));
+  const reconciled = reconcileRegistry(await loadRegistry(windowId), liveGroups);
+  let registry: HubGroupRegistry = reconciled.registry;
+  if (reconciled.dropped.length) await saveRegistry(windowId, registry);
 
-  let count = 0;
+  const tabs = await chrome.tabs.query({ windowId });
+  const plan = planGroupAssignment(
+    tabs.flatMap((tab) =>
+      tab.id == null || !tab.url ? [] : [{ id: tab.id, url: tab.url, pinned: tab.pinned, groupId: tab.groupId }]
+    ),
+    { hubTabId, registry, kindScope }
+  );
+  for (const skipped of plan.skipped) addSkip(result, skipped.reason);
+
   for (const kind of Object.keys(HUB_GROUPS) as HubKind[]) {
-    const tabIds = byKind[kind];
-    if (!tabIds.length) continue;
-    const group = HUB_GROUPS[kind];
-    await groupTabIdsByLabel(tabIds, windowId, group.title, group.color, true);
-    count += tabIds.length;
+    const tabIds = plan.assign[kind];
+    let groupId = registry.groups[kind];
+    if (!tabIds.length && groupId == null) continue;
+    try {
+      const wasCollapsed = groupId == null ? false : liveGroupsById.get(groupId)?.collapsed === true;
+      if (groupId == null) {
+        groupId = await chrome.tabs.group({ tabIds, createProperties: { windowId } });
+        await chrome.tabGroups.update(groupId, { title: hubGroupTitle(kind), color: HUB_GROUPS[kind].color });
+        registry = { ...registry, groups: { ...registry.groups, [kind]: groupId } };
+        await saveRegistry(windowId, registry);
+      } else if (tabIds.length) {
+        await chrome.tabs.group({ tabIds, groupId });
+        await chrome.tabGroups.update(groupId, { color: HUB_GROUPS[kind].color });
+      }
+      const collapseReason = await collapseGroup(groupId, windowId);
+      if (collapseReason) addSkip(result, collapseReason);
+      else if (tabIds.length || !wasCollapsed) {
+        addChanged(result, tabIds.length || tabs.filter((tab) => tab.groupId === groupId).length);
+        await markOrganized(windowId, kind, Date.now());
+      }
+    } catch (error) {
+      for (const tabId of tabIds) addFailure(result, tabId, String(error));
+    }
   }
-  return count;
+  return result;
 }
 
 /** Expand the kind groups managed by the new-tab hub. Returns their tab count. */
-export async function expandHubTabs(windowId: number): Promise<number> {
-  const titles = new Set(Object.values(HUB_GROUPS).map((group) => group.title));
-  const groups = (await chrome.tabGroups.query({ windowId })).filter((group) =>
-    titles.has(group.title ?? "")
-  );
-  if (!groups.length) return 0;
-  const groupIds = new Set(groups.map((group) => group.id));
+export async function expandHubTabs(
+  windowId: number,
+  kindScope: HubKind | "all" = "all"
+): Promise<OperationResult> {
+  const result = emptyResult();
+  const liveGroups = await chrome.tabGroups.query({ windowId });
+  const reconciled = reconcileRegistry(await loadRegistry(windowId), liveGroups);
+  if (reconciled.dropped.length) await saveRegistry(windowId, reconciled.registry);
+  const groupsById = new Map(liveGroups.map((group) => [group.id, group]));
   const tabs = await chrome.tabs.query({ windowId });
-  await Promise.all(
-    groups.map((group) => chrome.tabGroups.update(group.id, { collapsed: false }))
-  );
-  return tabs.filter((tab) => groupIds.has(tab.groupId)).length;
+  for (const kind of Object.keys(HUB_GROUPS) as HubKind[]) {
+    if (kindScope !== "all" && kind !== kindScope) {
+      if (reconciled.registry.groups[kind] != null) addSkip(result, "out-of-scope");
+      continue;
+    }
+    const groupId = reconciled.registry.groups[kind];
+    if (groupId == null) continue;
+    const group = groupsById.get(groupId);
+    if (!group) continue;
+    const tabCount = tabs.filter((tab) => tab.groupId === groupId).length;
+    if (!group.collapsed) {
+      addSkip(result, "already-expanded", tabCount);
+      continue;
+    }
+    try {
+      await chrome.tabGroups.update(groupId, { collapsed: false });
+      addChanged(result, tabCount);
+    } catch (error) {
+      addFailure(result, groupId, String(error));
+    }
+  }
+  return result;
 }
 
-/** Collapse a group; if every unpinned tab is inside it Chrome refuses, so park on a new tab first. */
-async function collapseGroup(groupId: number, windowId: number): Promise<void> {
+/** Collapse a group only when the active tab is outside it. */
+async function collapseGroup(groupId: number, windowId: number): Promise<string | null> {
+  const activeTabs = await chrome.tabs.query({ windowId, active: true });
+  if (activeTabs.some((tab) => tab.groupId === groupId)) return "active-tab-inside";
   try {
     await chrome.tabGroups.update(groupId, { collapsed: true });
+    return null;
   } catch {
-    await chrome.tabs.create({ windowId, active: true });
-    await chrome.tabGroups.update(groupId, { collapsed: true });
+    return "collapse-failed";
   }
 }
 

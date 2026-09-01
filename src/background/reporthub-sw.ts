@@ -5,6 +5,7 @@
  * never races the editor's own onMessage responses.
  */
 import type { Msg, MsgResponse } from "../reporthub/messages";
+import type { HubKind, OperationResult } from "../reporthub/tabpolicy";
 import {
   enforceEntryCap,
   ensureSchemaV3,
@@ -33,7 +34,12 @@ import {
 } from "../reporthub/tabops";
 import { inferService, isTargetFile, normalizeFileUrl, normalizeTarget } from "../reporthub/url";
 
-type HubTabstripMsg = { type: "collapse-hub-tabs" } | { type: "expand-hub-tabs" };
+type HubTabstripMsg = {
+  type: "collapse-hub-tabs" | "expand-hub-tabs";
+  windowId: number;
+  hubTabId: number;
+  kindScope: HubKind | "all";
+};
 type ReportHubMsg = Msg | HubTabstripMsg;
 
 const RH_TYPES = new Set<ReportHubMsg["type"]>([
@@ -62,8 +68,23 @@ const AUTO_DISCARD_PERIOD_MINUTES = 5;
 const replacementMigrations = new Map<number, Promise<void>>();
 const updateTimers = new Map<number, ReturnType<typeof setTimeout>>();
 const lastSignatures = new Map<number, { signature: string; at: number }>();
+const tabstripOperations = new Map<number, Promise<unknown>>();
 const UPDATE_DEBOUNCE_MS = 400;
 let schemaReady: Promise<void> = Promise.resolve();
+
+function queueTabstripOperation<T>(windowId: number, operation: () => Promise<T>): Promise<T> {
+  const previous = tabstripOperations.get(windowId) ?? Promise.resolve();
+  const queued = previous.catch(() => undefined).then(operation);
+  const tracked = queued.finally(() => {
+    if (tabstripOperations.get(windowId) === tracked) tabstripOperations.delete(windowId);
+  });
+  tabstripOperations.set(windowId, tracked);
+  return queued;
+}
+
+function isHubKindScope(value: unknown): value is HubKind | "all" {
+  return value === "all" || value === "web" || value === "html" || value === "pdf";
+}
 
 async function ensureAutoDiscardAlarm(): Promise<void> {
   const existing = await chrome.alarms.get(AUTO_DISCARD_ALARM);
@@ -186,25 +207,30 @@ export function initReportHub(): void {
   });
 
   chrome.runtime.onMessage.addListener(
-    (msg: ReportHubMsg, sender, sendResponse: (r: MsgResponse) => void) => {
+    (msg: ReportHubMsg, sender, sendResponse: (r: MsgResponse | OperationResult) => void) => {
       if (sender.id !== chrome.runtime.id) return;
       if (!msg || typeof msg !== "object" || !RH_TYPES.has(msg.type)) return;
       void (async () => {
         try {
           await schemaReady;
           const settings = await getSettings();
-          switch (msg.type) {
+            switch (msg.type) {
             case "collapse-hub-tabs": {
-              if (sender.tab?.id == null) throw new Error("Hub tab id is unavailable");
-              sendResponse({
-                ok: true,
-                count: await collapseHubTabs(settings, sender.tab.windowId, sender.tab.id)
-              });
+              if (!Number.isInteger(msg.windowId) || !Number.isInteger(msg.hubTabId) || !isHubKindScope(msg.kindScope)) {
+                throw new Error("Invalid hub tab strip request");
+              }
+              sendResponse(
+                await queueTabstripOperation(msg.windowId, () =>
+                  collapseHubTabs(settings, msg.windowId, msg.hubTabId, msg.kindScope)
+                )
+              );
               break;
             }
             case "expand-hub-tabs": {
-              if (sender.tab == null) throw new Error("Hub tab window is unavailable");
-              sendResponse({ ok: true, count: await expandHubTabs(sender.tab.windowId) });
+              if (!Number.isInteger(msg.windowId) || !Number.isInteger(msg.hubTabId) || !isHubKindScope(msg.kindScope)) {
+                throw new Error("Invalid hub tab strip request");
+              }
+              sendResponse(await queueTabstripOperation(msg.windowId, () => expandHubTabs(msg.windowId, msg.kindScope)));
               break;
             }
             case "organize-tabs":

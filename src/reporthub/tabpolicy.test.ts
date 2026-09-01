@@ -13,7 +13,12 @@ const {
   duplicateLooseKey,
   duplicateStrictKey,
   emptyResult,
-  planDuplicateClose
+  hubGroupTitle,
+  ownedGroupIds,
+  parseHubGroupTitle,
+  planGroupAssignment,
+  planDuplicateClose,
+  reconcileRegistry
 } = policy;
 
 type CloseCandidateTab = import("./tabpolicy").CloseCandidateTab;
@@ -175,4 +180,64 @@ test("operation result helpers preserve structured partial results", () => {
     skipped: [{ reason: "pinned", count: 3 }],
     failed: [{ tabId: 41, reason: "gone" }]
   });
+});
+
+test("hub group titles are namespaced and parse only exact managed titles", () => {
+  assert.equal(hubGroupTitle("web"), "Hub · Web");
+  assert.equal(parseHubGroupTitle("Hub · Web"), "web");
+  assert.equal(parseHubGroupTitle("Web"), null);
+  assert.equal(parseHubGroupTitle("Hub · web"), null);
+});
+
+test("reconcileRegistry drops gone and renamed group records", () => {
+  const registry = {
+    groups: { web: 11, html: 12, pdf: 13 },
+    lastOrganizedAt: { web: 1, html: 2, pdf: 3 }
+  };
+  const result = reconcileRegistry(registry, [
+    { id: 11, title: "Hub · Web", collapsed: true },
+    { id: 12, title: "Manual HTML", collapsed: false }
+  ]);
+
+  assert.deepEqual(result.registry, {
+    groups: { web: 11 },
+    lastOrganizedAt: { web: 1 }
+  });
+  assert.deepEqual(result.dropped, [
+    { kind: "html", groupId: 12, reason: "renamed" },
+    { kind: "pdf", groupId: 13, reason: "gone" }
+  ]);
+  assert.deepEqual(ownedGroupIds(result.registry), new Set([11]));
+});
+
+test("group assignment protects non-managed tabs and respects kind scope", () => {
+  const registry = {
+    groups: { web: 11, html: 12 },
+    lastOrganizedAt: {}
+  };
+  const plan = planGroupAssignment(
+    [
+      { id: 1, url: "https://x.test/a", pinned: true, groupId: -1 },
+      { id: 2, url: "https://x.test/hub", pinned: false, groupId: -1 },
+      { id: 3, url: "chrome://settings/", pinned: false, groupId: -1 },
+      { id: 4, url: "https://x.test/manual", pinned: false, groupId: 44 },
+      { id: 5, url: "https://x.test/already", pinned: false, groupId: 11 },
+      { id: 6, url: "file:///C:/report.html", pinned: false, groupId: 12 },
+      { id: 7, url: "https://x.test/move", pinned: false, groupId: -1 },
+      { id: 8, url: "https://x.test/file.pdf", pinned: false, groupId: -1 },
+      { id: 9, url: "https://x.test/reassign", pinned: false, groupId: 12 }
+    ],
+    { hubTabId: 2, registry, kindScope: "web" }
+  );
+
+  assert.deepEqual(plan.assign, { web: [7, 9], html: [], pdf: [] });
+  assert.deepEqual(plan.skipped, [
+    { tabId: 1, reason: "pinned" },
+    { tabId: 2, reason: "hub-tab" },
+    { tabId: 3, reason: "unsupported" },
+    { tabId: 4, reason: "foreign-group" },
+    { tabId: 5, reason: "already" },
+    { tabId: 6, reason: "out-of-scope" },
+    { tabId: 8, reason: "out-of-scope" }
+  ]);
 });

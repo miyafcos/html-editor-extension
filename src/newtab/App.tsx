@@ -1304,13 +1304,23 @@ export function App() {
   const runTabstripAction = useCallback(async (action: "collapse-hub-tabs" | "expand-hub-tabs") => {
     setTabstripBusy(true);
     try {
-      const response = (await chrome.runtime.sendMessage({ type: action })) as {
-        ok: boolean;
-        count?: number;
+      const hubTab = await chrome.tabs.getCurrent();
+      if (hubTab?.id == null) throw new Error("Hub tab is unavailable");
+      const result = (await chrome.runtime.sendMessage({
+        type: action,
+        windowId: hubTab.windowId,
+        hubTabId: hubTab.id,
+        kindScope: "all"
+      })) as {
+        changed: number;
+        skipped: { reason: string; count: number }[];
+        failed: { tabId: number; reason: string }[];
+      } | {
+        ok: false;
         error?: string;
       };
-      if (!response.ok) throw new Error(response.error ?? action);
-      const count = response.count ?? 0;
+      if ("ok" in result) throw new Error(result.error ?? action);
+      const count = result.changed;
       setToast({
         text:
           action === "collapse-hub-tabs"
